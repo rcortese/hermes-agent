@@ -533,8 +533,8 @@ export default function App() {
             >
               <div
                 className={cn(
-                  "flex items-center gap-2",
-                  collapsed && "lg:hidden",
+                  "flex items-center gap-2 lg:transition-opacity lg:duration-200",
+                  collapsed ? "lg:opacity-0 lg:pointer-events-none" : "lg:opacity-100",
                 )}
               >
                 <PluginSlot name="header-left" />
