@@ -4657,7 +4657,11 @@ class GatewayRunner:
 
         def _dispatchable_boards() -> list[dict]:
             nonlocal last_dispatch_warnings
-            boards = [b for b in _kb.list_boards(include_archived=False) if not b.get("archived")]
+            try:
+                boards = [b for b in _kb.list_boards(include_archived=False) if not b.get("archived")]
+            except Exception:
+                logger.exception("kanban dispatcher: board enumeration failed; falling back to default board")
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             dispatchable, warnings = _kb.dispatchable_boards(
                 boards,
                 dispatch_owner=dispatch_owner,
