@@ -219,6 +219,7 @@ class TestBoardCRUD:
             description="desc",
             icon="📦",
             color="#abcdef",
+            dispatch_owner=" Moss ",
         )
         assert meta["slug"] == "baz"
         assert meta["name"] == "Baz"
@@ -228,6 +229,9 @@ class TestBoardCRUD:
         assert again["name"] == "Baz"
         assert again["description"] == "desc"
         assert again["icon"] == "📦"
+        assert again["dispatch_owner"] == "moss"
+        kb.write_board_metadata("baz", dispatch_owner="")
+        assert kb.read_board_metadata("baz")["dispatch_owner"] is None
 
     def test_remove_archive(self, fresh_home):
         kb.create_board("toremove")
@@ -424,6 +428,29 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
 
 
 class TestCLI:
+    def test_dispatch_status_json_env_precedence_and_lifecycle(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_KANBAN_DISPATCH_OWNER": " Moss ",
+            "HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS": "false",
+        }
+        r = _cli(["dispatch-status", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert data["dispatch_owner"] == "moss"
+        assert data["dispatch_unowned_boards"] is False
+        assert data["live_gateway_status"] is False
+        assert data["config_reload"] == "restart-required"
+        assert data["board_metadata_lifecycle"] == "read-each-dispatch-tick"
+        assert "current CLI process" in " ".join(data["notes"])
+
+    def test_dispatch_status_text_lifecycle_wording(self, tmp_path):
+        r = _cli(["dispatch-status"], env_extra={"HERMES_HOME": str(tmp_path)})
+        assert r.returncode == 0, r.stderr
+        assert "current CLI process" in r.stdout
+        assert "restart-required" in r.stdout
+        assert "read-each-dispatch-tick" in r.stdout
+
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         res = _cli(["boards", "list", "--json"], env_extra=env)
@@ -436,7 +463,7 @@ class TestCLI:
     def test_boards_create_and_switch(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         r1 = _cli(
-            ["boards", "create", "myproj", "--name", "My Project", "--switch"],
+            ["boards", "create", "myproj", "--name", "My Project", "--dispatch-owner", "Moss", "--switch"],
             env_extra=env,
         )
         assert r1.returncode == 0, r1.stderr
@@ -447,6 +474,19 @@ class TestCLI:
         data = json.loads(r2.stdout)
         cur = [b for b in data if b["is_current"]][0]
         assert cur["slug"] == "myproj"
+        assert cur["dispatch_owner"] == "moss"
+
+    def test_boards_set_and_clear_owner_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "repair"], env_extra=env).returncode == 0
+        set_owner = _cli(["boards", "set-owner", "repair", " Moss "], env_extra=env)
+        assert set_owner.returncode == 0, set_owner.stderr
+        data = json.loads(_cli(["boards", "list", "--json"], env_extra=env).stdout)
+        assert [b for b in data if b["slug"] == "repair"][0]["dispatch_owner"] == "moss"
+        clear_owner = _cli(["boards", "clear-owner", "repair"], env_extra=env)
+        assert clear_owner.returncode == 0, clear_owner.stderr
+        data = json.loads(_cli(["boards", "list", "--json"], env_extra=env).stdout)
+        assert [b for b in data if b["slug"] == "repair"][0]["dispatch_owner"] is None
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

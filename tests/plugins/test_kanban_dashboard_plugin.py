@@ -64,6 +64,23 @@ def client(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_board_patch_dispatch_owner_omitted_preserves_and_null_clears(client):
+    r = client.post(
+        "/api/plugins/kanban/boards",
+        json={"slug": "repair", "dispatch_owner": "Moss"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["board"]["dispatch_owner"] == "moss"
+
+    r = client.patch("/api/plugins/kanban/boards/repair", json={"name": "Repair Board"})
+    assert r.status_code == 200, r.text
+    assert r.json()["board"]["dispatch_owner"] == "moss"
+
+    r = client.patch("/api/plugins/kanban/boards/repair", json={"dispatch_owner": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["board"]["dispatch_owner"] is None
+
+
 def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200

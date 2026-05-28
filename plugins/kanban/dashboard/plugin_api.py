@@ -1417,6 +1417,7 @@ class CreateBoardBody(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    dispatch_owner: Optional[str] = None
     switch: bool = False
 
 
@@ -1425,6 +1426,37 @@ class RenameBoardBody(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    dispatch_owner: Optional[str] = None
+
+
+def _model_fields_set(payload: BaseModel) -> set[str]:
+    fields = getattr(payload, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(payload, "__fields_set__", set())
+    return set(fields)
+
+
+def _kanban_dispatch_config() -> tuple[Optional[str], bool]:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    owner = os.environ.get("HERMES_KANBAN_DISPATCH_OWNER", kanban_cfg.get("dispatch_owner"))
+    unowned = os.environ.get("HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS", kanban_cfg.get("dispatch_unowned_boards", True))
+    return kanban_db.normalize_dispatch_owner(owner), kanban_db._coerce_dispatch_unowned(unowned)
+
+
+def _annotate_dispatchability(boards: list[dict]) -> list[str]:
+    owner, unowned = _kanban_dispatch_config()
+    warnings: list[str] = []
+    for b in boards:
+        info = kanban_db.board_dispatchability(b, dispatch_owner=owner, dispatch_unowned_boards=unowned)
+        b.update(info)
+        if info.get("dispatchability_warning") and len(warnings) < 5:
+            warnings.append(f"{b.get('slug') or kanban_db.DEFAULT_BOARD}: {info.get('dispatchability_warning')}")
+    return warnings
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -1454,7 +1486,8 @@ def list_boards(include_archived: bool = Query(False)):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
-    return {"boards": boards, "current": current}
+    dispatch_warnings = _annotate_dispatchability(boards)
+    return {"boards": boards, "current": current, "dispatchability_warnings": dispatch_warnings}
 
 
 @router.post("/boards")
@@ -1467,6 +1500,7 @@ def create_board_endpoint(payload: CreateBoardBody):
             description=payload.description,
             icon=payload.icon,
             color=payload.color,
+            dispatch_owner=payload.dispatch_owner,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1487,13 +1521,15 @@ def rename_board(slug: str, payload: RenameBoardBody):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
-    meta = kanban_db.write_board_metadata(
-        normed,
-        name=payload.name,
-        description=payload.description,
-        icon=payload.icon,
-        color=payload.color,
-    )
+    meta_kwargs = {
+        "name": payload.name,
+        "description": payload.description,
+        "icon": payload.icon,
+        "color": payload.color,
+    }
+    if "dispatch_owner" in _model_fields_set(payload):
+        meta_kwargs["dispatch_owner"] = payload.dispatch_owner
+    meta = kanban_db.write_board_metadata(normed, **meta_kwargs)
     return {"board": meta}
 
 

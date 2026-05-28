@@ -4644,6 +4644,33 @@ class GatewayRunner:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
+        dispatch_owner = _kb.normalize_dispatch_owner(
+            os.environ.get("HERMES_KANBAN_DISPATCH_OWNER", kanban_cfg.get("dispatch_owner"))
+        )
+        dispatch_unowned_boards = _kb._coerce_dispatch_unowned(
+            os.environ.get(
+                "HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS",
+                kanban_cfg.get("dispatch_unowned_boards", True),
+            )
+        )
+        last_dispatch_warnings: tuple[str, ...] = ()
+
+        def _dispatchable_boards() -> list[dict]:
+            nonlocal last_dispatch_warnings
+            boards = [b for b in _kb.list_boards(include_archived=False) if not b.get("archived")]
+            dispatchable, warnings = _kb.dispatchable_boards(
+                boards,
+                dispatch_owner=dispatch_owner,
+                dispatch_unowned_boards=dispatch_unowned_boards,
+            )
+            bounded = tuple(warnings[:5])
+            if bounded and bounded != last_dispatch_warnings:
+                logger.warning("kanban dispatcher: skipped boards: %s", "; ".join(bounded))
+                last_dispatch_warnings = bounded
+            elif not bounded:
+                last_dispatch_warnings = ()
+            return dispatchable
+
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
@@ -4720,10 +4747,7 @@ class GatewayRunner:
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _dispatchable_boards()
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -4742,10 +4766,7 @@ class GatewayRunner:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _dispatchable_boards()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -4763,6 +4784,11 @@ class GatewayRunner:
                             pass
             return False
 
+        logger.info(
+            "kanban dispatcher: owner=%s unowned=%s; config/env reload=restart-required; board metadata lifecycle=read-each-dispatch-tick",
+            dispatch_owner or "-",
+            dispatch_unowned_boards,
+        )
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
