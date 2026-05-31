@@ -9509,6 +9509,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                memory_policy=getattr(event, "memory_policy", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12598,6 +12599,7 @@ class GatewayRunner:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                memory_policy=getattr(event, "memory_policy", None),
             )
         )
         self._background_tasks.add(_task)
@@ -12614,6 +12616,7 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        memory_policy: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -12655,6 +12658,7 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            skip_memory_for_event = str(memory_policy or "").strip().lower() == "skip"
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -12701,6 +12705,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
+                    skip_memory=skip_memory_for_event,
                     fallback_model=self._fallback_model,
                 )
                 try:
@@ -16237,6 +16242,7 @@ class GatewayRunner:
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        skip_memory: bool = False,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -16264,6 +16270,11 @@ class GatewayRunner:
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``skip_memory`` also participates because a service-origin turn
+        must not reuse a previously cached memory-enabled agent, and a
+        later human turn must not reuse a service-origin memory-disabled
+        agent.  The memory provider lifecycle is frozen at construction.
         """
         import hashlib, json as _j
 
@@ -16290,6 +16301,7 @@ class GatewayRunner:
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                bool(skip_memory),
             ],
             sort_keys=True,
             default=str,
@@ -16978,6 +16990,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        memory_policy: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17617,6 +17630,7 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        skip_memory_for_event = str(memory_policy or "").strip().lower() == "skip"
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -17874,6 +17888,7 @@ class GatewayRunner:
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                skip_memory=skip_memory_for_event,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -17925,6 +17940,7 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
+                    skip_memory=skip_memory_for_event,
                     fallback_model=self._fallback_model,
                 )
                 if _cache_lock and _cache is not None:
@@ -19149,6 +19165,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    memory_policy=memory_policy,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

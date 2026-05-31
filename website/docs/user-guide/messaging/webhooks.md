@@ -85,6 +85,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `memory_policy` / `memoryPolicy` | No | Durable memory policy for agent-mode webhooks. Defaults to `skip`, so service-origin events can trigger an agent run without creating or writing a conversational memory peer such as `webhook:sentinel`. Other values currently fail closed to `skip`; trusted-human webhook memory must be implemented with an explicit reviewed identity mapping before enabling. |
 
 ### Full example
 
@@ -118,6 +119,17 @@ platforms:
           prompt: "New push to {repository.full_name} branch {ref}: {head_commit.message}"
           deliver: "telegram"
 ```
+
+### Deployment modes and memory identity
+
+Hermes separates the sender identity used by a transport from the conversational peer used by durable memory. Do not rely on chat IDs, route names, adapter labels, or other transport/source IDs as human memory identities.
+
+- `single_operator_private` — one private human operator owns the runtime. Pin the human memory peer explicitly in the memory provider configuration, for example with Honcho `pinUserPeer: true` or `pinPeerName`, after verifying that the runtime is not shared by multiple humans.
+- `multi_user_gateway` — several humans may share a gateway. Keep the default multi-user behavior: per-message `source.user_id` / `source.user_id_alt` determines the human peer. Do not globally make a configured `peerName` imply pinning.
+- `hybrid_operator_aliases` — mostly private runtimes with a few known operator aliases should use explicit reviewed alias configuration, such as `userPeerAliases`, instead of treating every transport ID as the same human.
+- `service_event/automation` — monitoring systems, CI, schedulers, Sentinel routes, and other machine-origin webhooks are not a human speaking. Agent-mode webhooks default to `memory_policy: skip`, which runs the agent with durable memory disabled. Direct delivery mode also bypasses the agent entirely.
+
+A service-origin event should not become `Rodolfo` by default, and it should not create durable peers named after routes such as `webhook:sentinel`. If you need a webhook that represents a trusted human, add an explicit reviewed route identity policy first; non-`skip` webhook memory policies currently fail closed to `skip`.
 
 ### Prompt Templates
 

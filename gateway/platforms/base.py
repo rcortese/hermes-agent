@@ -1448,6 +1448,11 @@ class MessageEvent:
     # Discord channel_skill_bindings).  A single name or ordered list.
     auto_skill: Optional[str | list[str]] = None
 
+    # Per-event durable memory policy. Service-origin adapters such as webhooks
+    # can set this to ``skip`` so the gateway still runs an agent but does not
+    # initialize persistent memory/Honcho for machine events.
+    memory_policy: Optional[str] = None
+
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
