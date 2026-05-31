@@ -587,6 +587,25 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
 
+        # Service-origin webhook routes are machine-to-machine by default.
+        # They may still need an agent run, but they must not become durable
+        # user memory peers such as ``webhook:sentinel`` unless a future
+        # route explicitly proves a trusted human principal. Fail closed:
+        # absent/unknown policy and incomplete human policy both skip memory.
+        configured_memory_policy = (
+            route_config.get("memory_policy")
+            if route_config.get("memory_policy") is not None
+            else route_config.get("memoryPolicy")
+        )
+        memory_policy = str(configured_memory_policy or "skip").strip().lower()
+        if memory_policy != "skip":
+            logger.warning(
+                "[webhook] route=%s requested unsupported memory_policy=%r; using skip",
+                route_name,
+                configured_memory_policy,
+            )
+            memory_policy = "skip"
+
         # Build source and event
         source = self.build_source(
             chat_id=session_chat_id,
@@ -601,6 +620,7 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            memory_policy=memory_policy,
         )
 
         logger.info(
