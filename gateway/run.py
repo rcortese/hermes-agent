@@ -5355,7 +5355,28 @@ class GatewayRunner:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        raw_owner = os.environ.get("HERMES_KANBAN_DISPATCH_OWNER")
+        if raw_owner is None:
+            raw_owner = kanban_cfg.get("dispatch_owner")
+        dispatch_owner = _kb.normalize_dispatch_owner(raw_owner)
+        raw_dispatch_unowned = os.environ.get("HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS")
+        if raw_dispatch_unowned is None:
+            raw_dispatch_unowned = kanban_cfg.get("dispatch_unowned_boards", True)
+        dispatch_unowned_boards = _kb._coerce_dispatch_unowned(raw_dispatch_unowned)
+        if dispatch_owner:
+            logger.info(
+                "kanban dispatcher: dispatch_owner=%r dispatch_unowned_boards=%s",
+                dispatch_owner, dispatch_unowned_boards,
+            )
+
+        try:
+            interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        except (ValueError, TypeError):
+            logger.warning(
+                "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
+                kanban_cfg.get("dispatch_interval_seconds"),
+            )
+            interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks
@@ -5558,6 +5579,13 @@ class GatewayRunner:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards, warnings = _kb.dispatchable_boards(
+                boards,
+                dispatch_owner=dispatch_owner,
+                dispatch_unowned_boards=dispatch_unowned_boards,
+            )
+            for warning in warnings:
+                logger.info("kanban dispatcher: skipping board %s", warning)
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -5580,6 +5608,11 @@ class GatewayRunner:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards, _warnings = _kb.dispatchable_boards(
+                boards,
+                dispatch_owner=dispatch_owner,
+                dispatch_unowned_boards=dispatch_unowned_boards,
+            )
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None

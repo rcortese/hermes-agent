@@ -1719,6 +1719,26 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw_owner = os.environ.get("HERMES_KANBAN_DISPATCH_OWNER")
+    if raw_owner is None:
+        raw_owner = kanban_cfg.get("dispatch_owner")
+    raw_unowned = os.environ.get("HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS")
+    if raw_unowned is None:
+        raw_unowned = kanban_cfg.get("dispatch_unowned_boards", True)
+    refusal = kanban_db.dispatch_refusal_payload(
+        kanban_db.read_board_metadata(board),
+        dispatch_owner=raw_owner,
+        dispatch_unowned_boards=raw_unowned,
+        dry_run=dry_run,
+    )
+    if refusal is not None:
+        return refusal
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
@@ -1743,6 +1763,7 @@ class CreateBoardBody(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    dispatch_owner: Optional[str] = None
     switch: bool = False
 
 
@@ -1751,6 +1772,7 @@ class RenameBoardBody(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    dispatch_owner: Optional[str] = None
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -1776,11 +1798,37 @@ def list_boards(include_archived: bool = Query(False)):
     """Return every board on disk with task counts and the active slug."""
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw_owner = os.environ.get("HERMES_KANBAN_DISPATCH_OWNER")
+    if raw_owner is None:
+        raw_owner = kanban_cfg.get("dispatch_owner")
+    raw_unowned = os.environ.get("HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS")
+    if raw_unowned is None:
+        raw_unowned = kanban_cfg.get("dispatch_unowned_boards", True)
+    known_owners = set()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
-    return {"boards": boards, "current": current}
+        b.update(kanban_db.board_dispatchability(
+            b,
+            dispatch_owner=raw_owner,
+            dispatch_unowned_boards=raw_unowned,
+        ))
+        if b.get("dispatch_owner"):
+            known_owners.add(b["dispatch_owner"])
+    return {
+        "boards": boards,
+        "current": current,
+        "known_dispatch_owners": sorted(known_owners),
+        "dispatch_owner": kanban_db.normalize_dispatch_owner(raw_owner),
+        "dispatch_unowned_boards": kanban_db._coerce_dispatch_unowned(raw_unowned),
+    }
 
 
 @router.post("/boards")
@@ -1793,6 +1841,7 @@ def create_board_endpoint(payload: CreateBoardBody):
             description=payload.description,
             icon=payload.icon,
             color=payload.color,
+            dispatch_owner=payload.dispatch_owner,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1819,6 +1868,7 @@ def rename_board(slug: str, payload: RenameBoardBody):
         description=payload.description,
         icon=payload.icon,
         color=payload.color,
+        dispatch_owner=payload.dispatch_owner,
     )
     return {"board": meta}
 

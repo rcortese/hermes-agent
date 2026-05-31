@@ -442,6 +442,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         "created_at": None,
         "archived": False,
+        "dispatch_owner": None,
     }
     try:
         p = board_metadata_path(slug)
@@ -454,8 +455,105 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
+    meta["dispatch_owner"] = normalize_dispatch_owner(meta.get("dispatch_owner"))
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def normalize_dispatch_owner(owner: Optional[str]) -> Optional[str]:
+    """Normalize a board dispatch owner: trim + lowercase; empty means unowned."""
+    if owner is None:
+        return None
+    s = str(owner).strip().lower()
+    return s or None
+
+
+def _coerce_dispatch_unowned(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def board_dispatchability(
+    board_meta: dict,
+    *,
+    dispatch_owner: Optional[str] = None,
+    dispatch_unowned_boards: object = True,
+) -> dict:
+    """Return dispatcher eligibility fields for one board."""
+    board_owner = normalize_dispatch_owner((board_meta or {}).get("dispatch_owner"))
+    configured_owner = normalize_dispatch_owner(dispatch_owner)
+    dispatch_unowned = _coerce_dispatch_unowned(dispatch_unowned_boards)
+    warning = None
+    if configured_owner and board_owner and board_owner != configured_owner:
+        dispatchable = False
+        warning = f"owned by {board_owner}; dispatcher owner is {configured_owner}"
+    elif configured_owner and board_owner is None and not dispatch_unowned:
+        dispatchable = False
+        warning = f"unowned board skipped by dispatcher owner {configured_owner}"
+    else:
+        dispatchable = True
+    return {
+        "dispatch_owner": board_owner,
+        "dispatchable": dispatchable,
+        "dispatchability_warning": warning,
+    }
+
+
+def dispatchable_boards(
+    boards: list[dict],
+    *,
+    dispatch_owner: Optional[str] = None,
+    dispatch_unowned_boards: object = True,
+) -> tuple[list[dict], list[str]]:
+    out: list[dict] = []
+    warnings: list[str] = []
+    for board in boards:
+        info = board_dispatchability(
+            board,
+            dispatch_owner=dispatch_owner,
+            dispatch_unowned_boards=dispatch_unowned_boards,
+        )
+        board.update(info)
+        if info["dispatchable"]:
+            out.append(board)
+        elif info.get("dispatchability_warning") and len(warnings) < 5:
+            warnings.append(f"{board.get('slug') or DEFAULT_BOARD}: {info.get('dispatchability_warning')}")
+    return out, warnings
+
+
+def dispatch_refusal_payload(
+    board_meta: dict,
+    *,
+    dispatch_owner: Optional[str] = None,
+    dispatch_unowned_boards: object = True,
+    dry_run: bool = False,
+) -> Optional[dict]:
+    info = board_dispatchability(
+        board_meta,
+        dispatch_owner=dispatch_owner,
+        dispatch_unowned_boards=dispatch_unowned_boards,
+    )
+    if info["dispatchable"]:
+        return None
+    return {
+        "skipped_dispatch": True,
+        "dry_run": bool(dry_run),
+        "dispatchable": False,
+        "dispatch_owner": info.get("dispatch_owner"),
+        "dispatchability_warning": info.get("dispatchability_warning"),
+        "reclaimed": 0,
+        "crashed": [],
+        "timed_out": [],
+        "stale": [],
+        "auto_blocked": [],
+        "promoted": 0,
+        "spawned": [],
+        "skipped_unassigned": [],
+        "skipped_nonspawnable": [],
+        "skipped_per_profile_capped": [],
+        "auto_assigned_default": [],
+    }
 
 
 def write_board_metadata(
@@ -467,6 +565,7 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    dispatch_owner: object = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -490,6 +589,8 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if dispatch_owner is not None:
+        meta["dispatch_owner"] = normalize_dispatch_owner(dispatch_owner)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -510,6 +611,7 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    dispatch_owner: Optional[str] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -527,6 +629,7 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
+        dispatch_owner=dispatch_owner,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
