@@ -29,6 +29,94 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
+def _kanban_dispatch_policy() -> tuple[Optional[str], bool, str]:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    source = "default"
+    raw_owner = os.environ.get("HERMES_KANBAN_DISPATCH_OWNER")
+    if raw_owner is not None:
+        source = "env"
+    else:
+        raw_owner = kanban_cfg.get("dispatch_owner")
+        if raw_owner is not None:
+            source = "config"
+    raw_unowned = os.environ.get("HERMES_KANBAN_DISPATCH_UNOWNED_BOARDS")
+    if raw_unowned is not None:
+        source = "env"
+    else:
+        raw_unowned = kanban_cfg.get("dispatch_unowned_boards", True)
+    return kb.normalize_dispatch_owner(raw_owner), kb._coerce_dispatch_unowned(raw_unowned), source
+
+
+def _kanban_dispatch_config() -> tuple[Optional[str], bool]:
+    owner, unowned, _source = _kanban_dispatch_policy()
+    return owner, unowned
+
+
+def _annotate_dispatchability(boards: list[dict]) -> list[str]:
+    owner, unowned = _kanban_dispatch_config()
+    warnings: list[str] = []
+    for b in boards:
+        info = kb.board_dispatchability(b, dispatch_owner=owner, dispatch_unowned_boards=unowned)
+        b.update(info)
+        if info.get("dispatchability_warning") and len(warnings) < 5:
+            warnings.append(f"{b.get('slug') or kb.DEFAULT_BOARD}: {info.get('dispatchability_warning')}")
+    return warnings
+
+
+def _kanban_dispatch_status_payload() -> dict[str, Any]:
+    owner, unowned, source = _kanban_dispatch_policy()
+    selected_board = kb.get_current_board()
+    board_meta = kb.read_board_metadata(selected_board)
+    dispatchability = kb.board_dispatchability(board_meta, dispatch_owner=owner, dispatch_unowned_boards=unowned)
+    return {
+        "selected_board": selected_board,
+        "board": selected_board,
+        "board_dispatch_owner": dispatchability.get("dispatch_owner"),
+        "dispatch_owner": owner,
+        "configured_dispatch_owner": owner,
+        "dispatchable": dispatchability.get("dispatchable"),
+        "dispatchability_warning": dispatchability.get("dispatchability_warning"),
+        "dispatch_unowned_boards": unowned,
+        "dispatch_policy_source": source,
+        "live_gateway_status": False,
+        "config_reload": "restart-required",
+        "board_metadata_lifecycle": "read-each-dispatch-tick",
+        "notes": [
+            "This reports the current CLI process configuration only, not live gateway state.",
+            "Gateway dispatcher config/env changes require a gateway restart.",
+            "Board metadata is read on each dispatch tick, so owner changes in board metadata are picked up without restart.",
+        ],
+    }
+
+
+def _cmd_dispatch_status(args: argparse.Namespace) -> int:
+    payload = _kanban_dispatch_status_payload()
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    owner = payload["dispatch_owner"] or "-"
+    print("Kanban dispatcher status (current CLI process):")
+    print(f"  Selected board:              {payload['selected_board']}")
+    print(f"  Board dispatch owner:        {payload['board_dispatch_owner'] or '-'}")
+    print(f"  Board dispatchable:          {payload['dispatchable']}")
+    if payload.get("dispatchability_warning"):
+        print(f"  Dispatch warning:            {payload['dispatchability_warning']}")
+    print(f"  Dispatch owner:              {owner}")
+    print(f"  Dispatch unowned boards:     {payload['dispatch_unowned_boards']}")
+    print(f"  Dispatch policy source:      {payload['dispatch_policy_source']}")
+    print(f"  Live gateway status:         {payload['live_gateway_status']}")
+    print(f"  Config reload:               {payload['config_reload']}")
+    print(f"  Board metadata lifecycle:    {payload['board_metadata_lifecycle']}")
+    for note in payload["notes"]:
+        print(f"  Note: {note}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
@@ -266,6 +354,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument("--dispatch-owner", default=None,
+                          help="Optional dispatcher owner for this board")
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -301,6 +391,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("slug")
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
+
+    b_set_owner = boards_sub.add_parser("set-owner", help="Set a board dispatch owner")
+    b_set_owner.add_argument("slug")
+    b_set_owner.add_argument("owner")
+    b_clear_owner = boards_sub.add_parser("clear-owner", help="Clear a board dispatch owner")
+    b_clear_owner.add_argument("slug")
+
+    p_status = sub.add_parser("dispatch-status", help="Show dispatcher owner policy and selected-board eligibility")
+    p_status.add_argument("--json", action="store_true")
 
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
@@ -959,6 +1058,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "dispatch-status": _cmd_dispatch_status,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1016,6 +1116,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-owner":
+        return _cmd_boards_set_owner(args)
+    if sub == "clear-owner":
+        return _cmd_boards_clear_owner(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1044,6 +1148,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
+    warnings = _annotate_dispatchability(boards)
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))
         return 0
@@ -1051,7 +1156,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     if not boards:
         print("(no boards — create one with `hermes kanban boards create <slug>`)")
         return 0
-    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
+    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  {'OWNER':16s}  {'DISPATCH':10s}  COUNTS")
     for b in boards:
         marker = "●" if b["is_current"] else " "
         counts = b["counts"] or {}
@@ -1062,9 +1167,14 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
+        owner = b.get("dispatch_owner") or "-"
+        dispatch_state = "ready" if b.get("dispatchable") else "blocked"
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {owner:16s}  {dispatch_state:10s}  {counts_str}")
     print()
     print(f"Current board: {current}")
+    if warnings:
+        for warning in warnings:
+            print(f"Warning: {warning}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
     return 0
@@ -1087,11 +1197,16 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         icon=args.icon,
         color=args.color,
         default_workdir=args.default_workdir,
+        dispatch_owner=getattr(args, "dispatch_owner", None),
     )
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
     print(f"  DB path:      {meta['db_path']}")
+    print(f"  Dispatch owner: {meta.get('dispatch_owner') or '-'}")
+    info = kb.board_dispatchability(meta, dispatch_owner=_kanban_dispatch_config()[0], dispatch_unowned_boards=_kanban_dispatch_config()[1])
+    if info.get("dispatchability_warning"):
+        print(f"  Warning: {info['dispatchability_warning']}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
@@ -1151,6 +1266,11 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}")
+    info = kb.board_dispatchability(meta, dispatch_owner=_kanban_dispatch_config()[0], dispatch_unowned_boards=_kanban_dispatch_config()[1])
+    print(f"  Dispatch owner: {meta.get('dispatch_owner') or '-'}")
+    print(f"  Dispatchable: {info.get('dispatchable')}")
+    if info.get("dispatchability_warning"):
+        print(f"  Dispatch warning: {info['dispatchability_warning']}")
     print(f"  Tasks:        {total} total"
           + (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})"
              if counts else ""))
@@ -1171,6 +1291,39 @@ def _cmd_boards_rename(args: argparse.Namespace) -> int:
     print(f"Board {normed!r} renamed to {meta['name']!r}.")
     return 0
 
+
+
+
+def _cmd_boards_set_owner(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-owner: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards set-owner: board {args.slug!r} does not exist", file=sys.stderr)
+        return 1
+    owner = kb.normalize_dispatch_owner(args.owner)
+    if not owner:
+        print("kanban boards set-owner: owner is required", file=sys.stderr)
+        return 2
+    meta = kb.write_board_metadata(normed, dispatch_owner=owner)
+    print(f"Board {normed!r} dispatch owner set to {meta.get('dispatch_owner')!r}.")
+    return 0
+
+
+def _cmd_boards_clear_owner(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards clear-owner: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards clear-owner: board {args.slug!r} does not exist", file=sys.stderr)
+        return 1
+    kb.write_board_metadata(normed, dispatch_owner="")
+    print(f"Board {normed!r} dispatch owner cleared.")
+    return 0
 
 def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     try:
@@ -2137,6 +2290,26 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    owner, unowned = _kanban_dispatch_config()
+    board = kb.get_current_board()
+    refusal = kb.dispatch_refusal_payload(
+        kb.read_board_metadata(board),
+        dispatch_owner=owner,
+        dispatch_unowned_boards=unowned,
+        dry_run=args.dry_run,
+    )
+    if refusal is not None:
+        if getattr(args, "json", False):
+            print(json.dumps(refusal, indent=2))
+        else:
+            print(f"Dispatch skipped: {refusal['dispatchability_warning']}")
+            print("Reclaimed:    0")
+            print("Crashed:      0")
+            print("Timed out:    0")
+            print("Auto-blocked: 0")
+            print("Promoted:     0")
+            print("Spawned:      0")
+        return 0
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
