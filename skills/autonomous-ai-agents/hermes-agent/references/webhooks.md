@@ -94,6 +94,16 @@ Prompts support `{dot.notation}` for accessing nested payload fields:
 
 If no prompt is specified, the full JSON payload is dumped into the agent prompt.
 
+## Durable memory and webhook identity
+
+Agent-mode webhooks are service-origin by default. They may trigger an agent run, but they should not be treated as a human speaking to memory. Current gateway behavior defaults webhook events to durable memory disabled (`memory_policy: skip` / `skip_memory=True`) so route names, chat IDs, source labels, and adapter IDs do not create Honcho peers such as `webhook:sentinel`.
+
+Use these deployment labels when documenting or reviewing webhook identity policy:
+- `single_operator_private` — a private one-human runtime may explicitly pin a human memory peer in the memory provider config after confirming it is not multi-user.
+- `multi_user_gateway` — preserve per-user source identity; do not globally make `peerName` imply pinning.
+- `hybrid_operator_aliases` — use explicit reviewed aliases such as `userPeerAliases` for known operators.
+- `service_event/automation` — CI, monitoring, schedulers, Sentinel, DIUN, Alertmanager, and similar webhook sources default to no durable user memory. If a route truly represents a trusted human, require an explicit reviewed identity mapping first; non-`skip` webhook memory policies currently fail closed to `skip`.
+
 ## Common Patterns
 
 ### GitHub: new issues
