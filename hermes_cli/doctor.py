@@ -703,6 +703,33 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+def _lazy_policy_bool(value) -> str:
+    if value is None:
+        return "unknown"
+    return "true" if value else "false"
+
+
+def _check_lazy_install_policy() -> None:
+    try:
+        from tools.lazy_deps import get_lazy_install_policy
+        policy = get_lazy_install_policy()
+    except Exception as exc:
+        check_warn("Lazy install policy", f"(could not determine: {exc})")
+        return
+
+    detail = f"(reason: {policy.reason})"
+    if policy.effective_lazy_installs:
+        check_ok("Lazy installs effective", detail)
+    else:
+        check_warn("Lazy installs disabled", detail)
+    env_value = policy.env_disable_lazy_installs_value
+    env_display = env_value if env_value is not None else "(unset)"
+    check_info(f"security.allow_lazy_installs: {_lazy_policy_bool(policy.config_allow_lazy_installs)}")
+    check_info(f"HERMES_DISABLE_LAZY_INSTALLS: {env_display}")
+    check_info(f"HERMES_LAZY_INSTALL_TARGET: {policy.lazy_install_target or '(unset)'}")
+    check_info(f"effective_lazy_installs: {_lazy_policy_bool(policy.effective_lazy_installs)}")
+    check_info(f"reason: {policy.reason}")
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -908,6 +935,9 @@ def run_doctor(args):
         except ImportError:
             check_warn(name, "(optional, not installed)")
     
+    _section("Lazy Install Policy")
+    _check_lazy_install_policy()
+
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()

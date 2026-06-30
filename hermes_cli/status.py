@@ -109,6 +109,29 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+def _lazy_policy_bool(value) -> str:
+    if value is None:
+        return "unknown"
+    return "true" if value else "false"
+
+
+def _print_lazy_install_policy_status() -> None:
+    try:
+        from tools.lazy_deps import get_lazy_install_policy
+        policy = get_lazy_install_policy()
+    except Exception as exc:
+        print(f"  Lazy installs: (could not determine: {exc})")
+        return
+
+    env_value = policy.env_disable_lazy_installs_value
+    env_display = env_value if env_value is not None else "(unset)"
+    print("  Lazy installs:")
+    print(f"    security.allow_lazy_installs: {_lazy_policy_bool(policy.config_allow_lazy_installs)}")
+    print(f"    HERMES_DISABLE_LAZY_INSTALLS: {env_display}")
+    print(f"    HERMES_LAZY_INSTALL_TARGET: {policy.lazy_install_target or '(unset)'}")
+    print(f"    effective_lazy_installs: {_lazy_policy_bool(policy.effective_lazy_installs)}")
+    print(f"    reason: {policy.reason}")
+
 from hermes_constants import is_termux as _is_termux
 
 
@@ -139,6 +162,7 @@ def show_status(args):
 
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
+    _print_lazy_install_policy_status()
 
     # =========================================================================
     # API Keys
