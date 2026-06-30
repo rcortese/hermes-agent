@@ -229,28 +229,105 @@ class _InstallResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class LazyInstallPolicy:
+    config_allow_lazy_installs: bool | None
+    config_source: str
+    env_disable_lazy_installs: bool
+    env_disable_lazy_installs_value: str | None
+    effective_lazy_installs: bool
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "security.allow_lazy_installs": self.config_allow_lazy_installs,
+            "config_source": self.config_source,
+            "HERMES_DISABLE_LAZY_INSTALLS": self.env_disable_lazy_installs_value,
+            "env_disable_lazy_installs": self.env_disable_lazy_installs,
+            "effective_lazy_installs": self.effective_lazy_installs,
+            "reason": self.reason,
+        }
+
+    def failure_reason(self) -> str:
+        env_value = self.env_disable_lazy_installs_value
+        env_display = env_value if env_value is not None else "(unset)"
+        return (
+            "lazy installs disabled "
+            f"({self.reason}; "
+            f"security.allow_lazy_installs={_policy_bool(self.config_allow_lazy_installs)}; "
+            f"HERMES_DISABLE_LAZY_INSTALLS={env_display}; "
+            f"effective_lazy_installs={_policy_bool(self.effective_lazy_installs)})"
+        )
+
+
+def _policy_bool(value: bool | None) -> str:
+    if value is None:
+        return "unknown"
+    return "true" if value else "false"
+
+
+def _coerce_policy_bool(value: Any, *, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def get_lazy_install_policy() -> LazyInstallPolicy:
+    # Contract: config value + env policy override -> effective runtime value.
+    env_value = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS")
+    env_disabled = env_value == "1"
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        sec = cfg.get("security") if isinstance(cfg, dict) else {}
+        if not isinstance(sec, dict):
+            sec = {}
+        if "allow_lazy_installs" in sec:
+            config_allow = _coerce_policy_bool(sec.get("allow_lazy_installs"), default=True)
+            config_source = "security.allow_lazy_installs"
+        else:
+            config_allow = True
+            config_source = "default"
+    except Exception as exc:
+        config_allow = True
+        config_source = f"default (config unreadable: {exc})"
+
+    if env_disabled:
+        effective = False
+        reason = "disabled by environment policy"
+    elif config_allow is False:
+        effective = False
+        reason = "disabled by config"
+    else:
+        effective = True
+        reason = "enabled by config" if config_source == "security.allow_lazy_installs" else "enabled by default"
+
+    return LazyInstallPolicy(
+        config_allow_lazy_installs=config_allow,
+        config_source=config_source,
+        env_disable_lazy_installs=env_disabled,
+        env_disable_lazy_installs_value=env_value,
+        effective_lazy_installs=effective,
+        reason=reason,
+    )
+
+
 # =============================================================================
 # Internals
 # =============================================================================
 
 
 def _allow_lazy_installs() -> bool:
-    """Return the ``security.allow_lazy_installs`` config flag.
-
-    Defaults to True. If config is unreadable we fail open (allow), because
-    refusing to install would lock people out of their own backends; the
-    decision to block is an explicit user opt-in.
-    """
-    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1":
-        return False
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-    except Exception:
-        return True
-    sec = cfg.get("security") or {}
-    val = sec.get("allow_lazy_installs", True)
-    return bool(val)
+    return get_lazy_install_policy().effective_lazy_installs
 
 
 def _spec_is_safe(spec: str) -> bool:
@@ -460,10 +537,11 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 f"refusing to install unsafe spec {spec!r}"
             )
 
-    if not _allow_lazy_installs():
+    lazy_policy = get_lazy_install_policy()
+    if not lazy_policy.effective_lazy_installs:
         raise FeatureUnavailable(
             feature, missing,
-            "lazy installs disabled (security.allow_lazy_installs=false)"
+            lazy_policy.failure_reason()
         )
 
     # Only show the interactive confirmation when we own a TTY and
