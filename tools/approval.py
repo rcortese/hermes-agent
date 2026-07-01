@@ -11,6 +11,8 @@ This module is the single source of truth for the dangerous command system:
 import contextvars
 import fnmatch
 import functools
+import hashlib
+import json
 import logging
 import os
 import re
@@ -1857,6 +1859,135 @@ def _strip_line_comment(line: str) -> str:
         i += 1
     return line
 
+def _command_privacy_fingerprint(command: str) -> str:
+    """Short non-reversible fingerprint for approval telemetry dedupe."""
+    normalized = re.sub(r'\s+', ' ', command or '').strip().lower()
+    return hashlib.sha256(normalized.encode('utf-8', 'replace')).hexdigest()[:12]
+
+
+def _approval_command_family(command: str) -> str:
+    """Classify a command without preserving the raw command text."""
+    c = (command or '').lower()
+    if re.search(r'\bgit\s+push\b', c):
+        return 'git_push'
+    if re.search(r'\bgit\s+(reset|clean|branch)\b', c):
+        return 'git_local_destructive'
+    if re.search(r'\b(docker|docker\s+compose)\s+(restart|stop|kill|down)\b', c):
+        return 'lifecycle'
+    if re.search(r'\b(?:curl|wget|git|gh|ssh|docker|hermes|kanban)\b[^\n|;&]*\|\s*(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b', c):
+        return 'pipe_to_interpreter'
+    if re.search(r'\b(?:python[23]?|perl|ruby|node)\b\s+(?:-[ec]|<<)', c):
+        return 'interpreter_inline'
+    if re.search(r'\b(?:bash|sh|zsh|ksh)\b\s+-[^\s]*c\b', c):
+        return 'shell_wrapper'
+    if re.search(r'\brm\b|\bfind\b.*(?:-delete|-exec)', c):
+        return 'delete_cleanup'
+    if re.search(r'\b(?:tee|sed|perl|ruby|cp|mv|install)\b|>>?', c):
+        return 'file_write'
+    return 'other'
+
+
+def _approval_target_scope(command: str, description: str = '') -> str:
+    """Coarse target scope for telemetry/manual-floor decisions; no raw paths."""
+    c = (command or '').lower()
+    d = (description or '').lower()
+    if any(x in c or x in d for x in ['.hermes/config.yaml', '$hermes_home', '~/.hermes/config.yaml']):
+        return 'hermes_config'
+    if any(x in c or x in d for x in ['.hermes/.env', '~/.hermes/.env']):
+        return 'hermes_env'
+    if '.env' in c or 'project env' in d or 'runtime env' in d:
+        return 'project_env'
+    if 'config.yaml' in c or 'compose.yaml' in c or 'project config' in d:
+        return 'project_config'
+    if re.search(r'\bgit\s+push\b', c):
+        return 'remote_git'
+    if re.search(r'\b/tmp\b|/cache/|/tmp/', c):
+        return 'temp_cache'
+    if re.search(r'/opt/data|/mnt/user/appdata|/agents/', c):
+        return 'runtime_or_repo'
+    return 'unknown'
+
+
+def _approval_risk_class(command: str, description: str) -> str:
+    c = (command or '').lower()
+    d = (description or '').lower()
+    if 'pipe to interpreter' in d or _approval_command_family(command) == 'pipe_to_interpreter':
+        return 'pipe_to_interpreter'
+    if re.search(r'\bgit\s+push\b.*(?:--force|-f\b|:\S+)', c) or 'force push' in d:
+        return 'git_history_remote'
+    if any(x in d for x in ['hermes config/env', 'project env/config', 'overwrite project env/config', 'overwrite system file']) or _approval_target_scope(command, description) in {'hermes_config', 'hermes_env', 'project_env', 'project_config'}:
+        return 'env_config_write'
+    if _approval_command_family(command) == 'delete_cleanup':
+        return 'delete_cleanup'
+    if _approval_command_family(command) == 'shell_wrapper':
+        return 'generic_wrapper'
+    if _approval_command_family(command) == 'lifecycle':
+        return 'lifecycle'
+    return 'other'
+
+
+def _smart_manual_floor_reason(command: str, description: str) -> Optional[str]:
+    """Return a narrow reason that must bypass smart auto-approval.
+
+    This is deliberately not a hard block: it only escalates to the normal
+    approval prompt. The cutoff reflects Moss's low-friction policy: keep smart
+    permissive for generic wrappers and most cleanup, but never let the aux LLM
+    silently auto-approve the three high-signal classes from the 2026-07-01
+    calibration review.
+    """
+    risk_class = _approval_risk_class(command, description)
+    if risk_class == 'pipe_to_interpreter':
+        return 'manual_floor:pipe_to_interpreter'
+    if risk_class == 'git_history_remote':
+        return 'manual_floor:git_history_remote'
+    if risk_class == 'env_config_write':
+        return 'manual_floor:env_config_write'
+    return None
+
+
+def _emit_approval_telemetry(
+    *,
+    phase: str,
+    decision: str,
+    command: str,
+    description: str,
+    pattern_keys: list[str] | None = None,
+    surface: str = '',
+    env_type: str = '',
+    approval_mode: str = '',
+    manual_floor_reason: str | None = None,
+    persistence_scope: str = 'none',
+) -> None:
+    """Emit privacy-preserving structured approval telemetry.
+
+    The event intentionally omits raw commands, full paths, full hashes, and
+    exact timestamps. Logger timestamps may still exist in log transport, but
+    the payload itself only carries a coarse hour bucket for calibration.
+    """
+    try:
+        now = int(time.time())
+        payload = {
+            'event': 'approval_decision',
+            'phase': phase,
+            'decision': decision,
+            'approval_mode': approval_mode or _get_approval_mode(),
+            'surface': surface or ('gateway' if _is_gateway_approval_context() else 'cli' if env_var_enabled('HERMES_INTERACTIVE') else 'noninteractive'),
+            'env_type': env_type or 'unknown',
+            'coarse_time_bucket': now - (now % 3600),
+            'risk_class': _approval_risk_class(command, description),
+            'command_family': _approval_command_family(command),
+            'target_scope': _approval_target_scope(command, description),
+            'pattern_keys': sorted(str(k)[:80] for k in (pattern_keys or [])),
+            'matched_count': len(pattern_keys or []),
+            'manual_floor_reason': manual_floor_reason or '',
+            'persistence_scope': persistence_scope,
+            'command_fingerprint12': _command_privacy_fingerprint(command),
+        }
+        logger.info('approval.telemetry %s', json.dumps(payload, sort_keys=True, separators=(',', ':')))
+    except Exception as exc:
+        logger.debug('approval telemetry failed: %s', exc)
+
+
 
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
@@ -2043,6 +2174,16 @@ def check_dangerous_command(command: str, env_type: str,
                                        approval_callback=approval_callback)
 
     if choice == "deny":
+        _emit_approval_telemetry(
+            phase="manual",
+            decision="manual_denied",
+            command=command,
+            description=description,
+            pattern_keys=[pattern_key],
+            surface="cli",
+            env_type=env_type,
+            approval_mode=_get_approval_mode(),
+        )
         return {
             "approved": False,
             "message": f"BLOCKED: User denied this potentially dangerous command (matched '{description}' pattern). Do NOT retry this command - the user has explicitly rejected it.",
@@ -2409,25 +2550,66 @@ def check_all_command_guards(command: str, env_type: str,
     # (openai/codex#13860).
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        verdict = _smart_approve(command, combined_desc_for_llm)
-        if verdict == "approve":
-            # Auto-approve and grant session-level approval for these patterns
-            for key, _, _ in warnings:
-                approve_session(session_key, key)
-            logger.debug("Smart approval: auto-approved '%s' (%s)",
-                         command[:60], combined_desc_for_llm)
-            return {"approved": True, "message": None,
-                    "smart_approved": True,
-                    "description": combined_desc_for_llm}
-        elif verdict == "deny":
-            combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-            return {
-                "approved": False,
-                "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
-                           "The command was assessed as genuinely dangerous. Do NOT retry.",
-                "smart_denied": True,
-            }
-        # verdict == "escalate" → fall through to manual prompt
+        pattern_keys_for_telemetry = [key for key, _, _ in warnings]
+        manual_floor_reason = _smart_manual_floor_reason(command, combined_desc_for_llm)
+        if manual_floor_reason:
+            _emit_approval_telemetry(
+                phase="smart",
+                decision="manual_floor_escalate",
+                command=command,
+                description=combined_desc_for_llm,
+                pattern_keys=pattern_keys_for_telemetry,
+                env_type=env_type,
+                approval_mode=approval_mode,
+                manual_floor_reason=manual_floor_reason,
+            )
+        else:
+            verdict = _smart_approve(command, combined_desc_for_llm)
+            if verdict == "approve":
+                # Auto-approve and grant session-level approval for these patterns
+                for key, _, _ in warnings:
+                    approve_session(session_key, key)
+                logger.debug("Smart approval: auto-approved '%s' (%s)",
+                             command[:60], combined_desc_for_llm)
+                _emit_approval_telemetry(
+                    phase="smart",
+                    decision="auto_approved",
+                    command=command,
+                    description=combined_desc_for_llm,
+                    pattern_keys=pattern_keys_for_telemetry,
+                    env_type=env_type,
+                    approval_mode=approval_mode,
+                    persistence_scope="session",
+                )
+                return {"approved": True, "message": None,
+                        "smart_approved": True,
+                        "description": combined_desc_for_llm}
+            elif verdict == "deny":
+                _emit_approval_telemetry(
+                    phase="smart",
+                    decision="smart_denied",
+                    command=command,
+                    description=combined_desc_for_llm,
+                    pattern_keys=pattern_keys_for_telemetry,
+                    env_type=env_type,
+                    approval_mode=approval_mode,
+                )
+                return {
+                    "approved": False,
+                    "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
+                               "The command was assessed as genuinely dangerous. Do NOT retry.",
+                    "smart_denied": True,
+                }
+            _emit_approval_telemetry(
+                phase="smart",
+                decision="smart_escalate",
+                command=command,
+                description=combined_desc_for_llm,
+                pattern_keys=pattern_keys_for_telemetry,
+                env_type=env_type,
+                approval_mode=approval_mode,
+            )
+        # verdict == "escalate" or manual floor → fall through to manual prompt
 
     # --- Phase 3: Approval ---
 
@@ -2482,6 +2664,16 @@ def check_all_command_guards(command: str, env_type: str,
             choice = decision["choice"]
 
             if not resolved or choice is None or choice == "deny":
+                _emit_approval_telemetry(
+                    phase="manual",
+                    decision="manual_timeout_or_denied" if not resolved or choice is None else "manual_denied",
+                    command=command,
+                    description=combined_desc,
+                    pattern_keys=all_keys,
+                    surface="gateway",
+                    env_type=env_type,
+                    approval_mode=approval_mode,
+                )
                 # Consent contract: silence is NOT consent, and an explicit
                 # deny is also a hard halt — both produce a BLOCKED outcome
                 # that names the agent's most common evasion paths (retry,
@@ -2523,6 +2715,17 @@ def check_all_command_guards(command: str, env_type: str,
                 # choice == "once": no persistence — command allowed this
                 # single time only, matching the CLI's behavior.
 
+            _emit_approval_telemetry(
+                phase="manual",
+                decision="manual_approved",
+                command=command,
+                description=combined_desc,
+                pattern_keys=all_keys,
+                surface="gateway",
+                env_type=env_type,
+                approval_mode=approval_mode,
+                persistence_scope=choice or "once",
+            )
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
 
@@ -2577,6 +2780,16 @@ def check_all_command_guards(command: str, env_type: str,
     )
 
     if choice == "deny":
+        _emit_approval_telemetry(
+            phase="manual",
+            decision="manual_denied",
+            command=command,
+            description=combined_desc,
+            pattern_keys=all_keys,
+            surface="cli",
+            env_type=env_type,
+            approval_mode=approval_mode,
+        )
         return {
             "approved": False,
             "message": (
@@ -2604,6 +2817,17 @@ def check_all_command_guards(command: str, env_type: str,
             approve_permanent(key)
             save_permanent_allowlist(_permanent_approved)
 
+    _emit_approval_telemetry(
+        phase="manual",
+        decision="manual_approved",
+        command=command,
+        description=combined_desc,
+        pattern_keys=all_keys,
+        surface="cli",
+        env_type=env_type,
+        approval_mode=approval_mode,
+        persistence_scope=choice or "once",
+    )
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
 
