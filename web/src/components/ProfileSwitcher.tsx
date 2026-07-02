@@ -67,10 +67,10 @@ export function ProfileSwitcher({ collapsed }: ProfileSwitcherProps) {
         <SelectOption value="">{currentDashboardLabel}</SelectOption>
 
         {profiles
-          .filter((name) => name !== currentProfile)
-          .map((name) => (
-            <SelectOption key={name} value={name}>
-              {name}
+          .filter((option) => option.name !== currentProfile)
+          .map((option) => (
+            <SelectOption key={option.name} value={option.name}>
+              {option.label || option.name}
             </SelectOption>
           ))}
       </Select>
