@@ -52,10 +52,10 @@ export function ProfileSwitcher({ collapsed }: { collapsed?: boolean }) {
           )}
         </option>
         {profiles
-          .filter((name) => name !== currentProfile)
-          .map((name) => (
-            <option key={name} value={name}>
-              {name}
+          .filter((option) => option.name !== currentProfile)
+          .map((option) => (
+            <option key={option.name} value={option.name}>
+              {option.label || option.name}
             </option>
           ))}
       </select>
