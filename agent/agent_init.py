@@ -61,6 +61,42 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+_HUMAN_MEMORY_SURFACES = frozenset({"telegram", "webui"})
+_MEMORY_BLOCKING_ENV_FLAGS = (
+    "HERMES_SAFE_MODE",
+    "HERMES_IGNORE_RULES",
+    "HERMES_IGNORE_USER_CONFIG",
+)
+
+
+def _memory_identity(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _should_skip_memory_for_runtime(
+    *,
+    platform: object = None,
+    explicit_skip_memory: bool = False,
+) -> bool:
+    """Return True unless this is an allowlisted direct human surface.
+
+    In this deployment, persistent memory/Honcho is only allowed for direct
+    operator interaction over Telegram or an explicit WebUI marker. Generic
+    API-server, CLI/TUI/desktop, cron, subagents, one-shot runs, tools, and
+    unknown/programmatic callers are memory-off by default.
+    """
+    if explicit_skip_memory:
+        return True
+    for name in _MEMORY_BLOCKING_ENV_FLAGS:
+        if is_truthy_value(os.environ.get(name)):
+            return True
+    # Do not treat process/global environment markers as authorization. They are
+    # useful routing hints, but CLI/cron/oneshot/subagent/API-server processes can
+    # inherit or inject them. Memory requires the caller to identify the live
+    # AIAgent itself as an allowlisted human surface.
+    return _memory_identity(platform) not in _HUMAN_MEMORY_SURFACES
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -569,6 +605,10 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+    skip_memory = _should_skip_memory_for_runtime(
+        platform=platform,
+        explicit_skip_memory=bool(skip_memory),
+    )
 
     agent.model = model
     agent.max_iterations = max_iterations
