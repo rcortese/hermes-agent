@@ -955,11 +955,13 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             )
 
     lazy_policy = get_lazy_install_policy()
-    if not lazy_policy.effective_lazy_installs:
-        raise FeatureUnavailable(
-            feature, missing,
+    if not _allow_lazy_installs():
+        reason = (
             lazy_policy.failure_reason()
+            if not lazy_policy.effective_lazy_installs
+            else "lazy installs disabled by runtime gate"
         )
+        raise FeatureUnavailable(feature, missing, reason)
 
     # Only show the interactive confirmation when we own a TTY and
     # prompt_toolkit isn't running.  A bare input() deadlocks when a
