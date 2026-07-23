@@ -146,8 +146,12 @@ RUN set -eu; \
 # updated.
 COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 
-# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
+# Non-root runtime identity. Build args keep the fork reusable while the Moss
+# base defaults to Unraid's nobody:users ownership contract (99:100).
+ARG HERMES_UID=99
+ARG HERMES_GID=100
+RUN getent group "${HERMES_GID}" >/dev/null && \
+    useradd -u "${HERMES_UID}" -g "${HERMES_GID}" -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 

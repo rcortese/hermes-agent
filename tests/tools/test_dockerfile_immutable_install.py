@@ -24,6 +24,16 @@ def test_dockerfile_makes_opt_hermes_readonly_for_hermes_user() -> None:
     assert "chmod -R a-w /opt/hermes" not in text
 
 
+def test_dockerfile_defaults_runtime_identity_to_moss_contract() -> None:
+    text = _dockerfile_text()
+
+    assert "ARG HERMES_UID=99" in text
+    assert "ARG HERMES_GID=100" in text
+    assert 'getent group "${HERMES_GID}"' in text
+    assert 'useradd -u "${HERMES_UID}" -g "${HERMES_GID}"' in text
+    assert "useradd -u 10000" not in text
+
+
 def test_dockerfile_does_not_chown_install_trees_to_hermes() -> None:
     text = _dockerfile_text()
     forbidden_patterns = (
