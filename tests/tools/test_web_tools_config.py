@@ -379,6 +379,45 @@ class TestWebSearchErrorHandling:
         assert "exception_chain" not in result
         assert "traceback" not in result
 
+    def test_search_uses_configured_fallback_after_primary_exception(self):
+        import tools.web_tools
+
+        primary = MagicMock()
+        primary.name = "firecrawl"
+        primary.supports_search.return_value = True
+        primary.search.side_effect = RuntimeError("primary down")
+        fallback = MagicMock()
+        fallback.name = "brave-free"
+        fallback.supports_search.return_value = True
+        fallback.search.return_value = {"success": True, "data": {"web": []}}
+
+        def provider_for(name):
+            return {"firecrawl": primary, "brave-free": fallback}.get(name)
+
+        with patch("tools.web_tools._get_search_backend", return_value="firecrawl"), \
+             patch("tools.web_tools._get_search_fallback_backends", return_value=["brave-free"]), \
+             patch("tools.web_tools._is_backend_available", return_value=True), \
+             patch("agent.web_search_registry.get_provider", side_effect=provider_for), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+        assert result["success"] is True
+        assert result["metadata"]["backend"] == "brave-free"
+        assert result["metadata"]["fallback_from"] == "firecrawl"
+        assert result["metadata"]["fallback_failures"] == ["firecrawl: primary down"]
+        primary.search.assert_called_once_with("test query", 3)
+        fallback.search.assert_called_once_with("test query", 3)
+
+    def test_fallback_names_are_normalized_and_deduplicated(self):
+        from tools.web_tools import _normalise_backend_name_list
+
+        assert _normalise_backend_name_list(" brave-free,BRAVE-FREE;ddgs,unknown ") == [
+            "brave-free",
+            "ddgs",
+        ]
+
 
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""

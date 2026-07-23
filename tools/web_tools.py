@@ -780,6 +780,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 }
         else:
             failures = []
+            last_provider_exception = None
             response_data = None
             for index, candidate in enumerate(providers):
                 role = "primary" if index == 0 else "fallback"
@@ -790,6 +791,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     )
                     candidate_response = candidate.search(query, limit)
                 except Exception as exc:  # noqa: BLE001 - fallback path needs provider errors
+                    last_provider_exception = exc
                     failures.append(f"{candidate.name}: {exc}")
                     logger.warning(
                         "Web search provider %s failed; trying fallback if configured: %s",
@@ -823,6 +825,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 break
 
             if response_data is None:
+                if len(providers) == 1 and last_provider_exception is not None:
+                    # Preserve the pre-fallback public error contract when no
+                    # fallback was configured and the sole provider raised.
+                    raise last_provider_exception
                 response_data = {
                     "success": False,
                     "error": "All configured web search providers failed: " + "; ".join(failures),
