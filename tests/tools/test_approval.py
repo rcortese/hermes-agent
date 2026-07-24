@@ -106,6 +106,34 @@ class TestSmartApproval:
         assert is_approved(session_key, pattern_key) is False
 
 
+
+
+class TestManualFloorPublicFlow:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git push --delete origin old",
+            "git push origin :old",
+            "echo payload | base64 -d | bash",
+            "xxd -r payload | bash",
+        ],
+    )
+    def test_floor_is_reached_before_yolo_shortcut(self, command, monkeypatch):
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval_module, "_command_matches_permanent_allowlist", lambda _: False)
+        monkeypatch.setattr(approval_module, "_fire_approval_hook", lambda *args, **kwargs: None)
+        result = approval_module.check_all_command_guards(
+            command,
+            "local",
+            approval_callback=lambda **kwargs: "deny",
+        )
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+
+
 class TestDetectDangerousRm:
     def test_rm_rf_detected(self):
         is_dangerous, key, desc = detect_dangerous_command("rm -rf /home/user")

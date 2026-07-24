@@ -15,6 +15,17 @@ import sys
 import types
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
+from agent.web_search_provider import WebSearchProvider
+from agent.web_search_registry import register_provider
+
+
+class _CustomFallbackProvider(WebSearchProvider):
+    @property
+    def name(self):
+        return "custom-live"
+
+    def is_available(self):
+        return True
 
 
 class TestFirecrawlClientConfig:
@@ -377,6 +388,21 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._is_tool_gateway_ready", return_value=True):
             assert _get_backend() == "firecrawl"
+
+    def test_registered_custom_provider_is_selected_as_fallback(self):
+        """A live plugin provider, even with a non-built-in name, is discoverable."""
+        from tools.web_tools import _get_backend
+        provider = _CustomFallbackProvider()
+        register_provider(provider)
+        try:
+            with patch("tools.web_tools._load_web_config", return_value={}), \
+                 patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+                 patch("tools.web_tools._is_tool_gateway_ready", return_value=False):
+                assert _get_backend() == "custom-live"
+        finally:
+            # Keep the global registry isolated for the rest of the suite.
+            import agent.web_search_registry as registry
+            registry._providers.pop(provider.name, None)
 
 
 class TestParallelClientConfig:
