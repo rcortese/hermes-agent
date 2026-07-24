@@ -297,6 +297,8 @@ def _get_extract_backend() -> str:
 
 def _normalise_backend_name_list(raw: object) -> list[str]:
     # Return a normalized list of backend names from YAML/list/env values.
+    # Provider names are sourced from the live registry rather than a closed
+    # allowlist so plugins may contribute arbitrary backends.
     if raw is None:
         return []
     if isinstance(raw, str):
@@ -306,7 +308,12 @@ def _normalise_backend_name_list(raw: object) -> list[str]:
     else:
         parts = [str(raw)]
 
-    valid = {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
+    valid = set(_LEGACY_WEB_BACKENDS)
+    valid.update(
+        getattr(provider, "name", "")
+        for provider in _list_registered_web_providers()
+        if isinstance(getattr(provider, "name", ""), str)
+    )
     names: list[str] = []
     seen: set[str] = set()
     for part in parts:

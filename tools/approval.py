@@ -2894,11 +2894,17 @@ def _smart_manual_floor_reason(command: str, description: str) -> Optional[str]:
     description_lc = (description or "").lower()
 
     pipe_to_interpreter = re.search(
-        r"\b(?:curl|wget|git|gh|ssh|docker|hermes|kanban)\b[^\n|;&]*"
+        r"\b(?:curl|wget|git|gh|ssh|docker|hermes|kanban|echo|base64|base32|base16|xxd)\b[^\n|;&]*"
         r"\|\s*(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b",
         command_lc,
     )
-    if pipe_to_interpreter or "pipe to interpreter" in description_lc:
+    decoded_pipe_to_interpreter = re.search(
+        r"\b(?:echo|printf|cat)\b[^\n|;&]*\|\s*"
+        r"(?:base64|base32|base16)\b[^\n|;&]*\|\s*"
+        r"(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b",
+        command_lc,
+    )
+    if pipe_to_interpreter or decoded_pipe_to_interpreter or "pipe to interpreter" in description_lc:
         return "manual_floor:pipe_to_interpreter"
 
     remote_history_mutation = re.search(
@@ -3588,7 +3594,16 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # Hardline floor: unconditional block for catastrophic commands
+    # Compute the smart-approval manual floor here, before bypass,
+    # permanent-allowlist, and non-interactive shortcuts. This keeps the
+    # safety floor on the public guard flow while ordinary smart wrappers still
+    # use the observer/telemetry path below.
+    approval_mode = _get_approval_mode()
+    manual_floor_reason = (
+        _smart_manual_floor_reason(command, "")
+        if approval_mode == "smart"
+        else None
+    )
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
     # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
     # no session-level setting can bypass it.
@@ -3619,11 +3634,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        manual_floor_reason is None
+        and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off")
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if manual_floor_reason is None and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3632,7 +3649,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if manual_floor_reason is None and not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -3767,6 +3784,9 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+
+    if manual_floor_reason is not None:
+        warnings.append((manual_floor_reason, manual_floor_reason, False))
 
     # Nothing to warn about
     if not warnings:
