@@ -591,6 +591,46 @@ class TestWebSearchErrorHandling:
             "ddgs",
         ]
 
+    def test_configured_live_provider_fallback_executes_after_primary_failure(self):
+        """A plugin provider admitted by the live registry survives the real
+        web.search_fallback_backends config path and executes after failure.
+
+        This must fail if custom registry names are removed from fallback
+        normalization, even though the provider object is otherwise available.
+        """
+        import agent.web_search_registry as registry
+        import tools.web_tools
+
+        provider = _CustomFallbackProvider()
+        provider.supports_search = MagicMock(return_value=True)
+        provider.search = MagicMock(return_value={"success": True, "data": {"web": []}})
+        primary = MagicMock()
+        primary.name = "firecrawl"
+        primary.supports_search.return_value = True
+        primary.search.side_effect = RuntimeError("primary down")
+        register_provider(provider)
+        try:
+            def provider_for(name):
+                return {"firecrawl": primary, "custom-live": provider}.get(name)
+
+            with patch("tools.web_tools._get_search_backend", return_value="firecrawl"), \
+                 patch("tools.web_tools._load_web_config", return_value={
+                     "search_fallback_backends": ["custom-live"],
+                 }), \
+                 patch("agent.web_search_registry.get_provider", side_effect=provider_for), \
+                 patch("tools.interrupt.is_interrupted", return_value=False), \
+                 patch.object(tools.web_tools._debug, "log_call"), \
+                 patch.object(tools.web_tools._debug, "save"):
+                result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+            assert result["success"] is True
+            assert result["metadata"]["backend"] == "custom-live"
+            assert result["metadata"]["fallback_from"] == "firecrawl"
+            primary.search.assert_called_once_with("test query", 3)
+            provider.search.assert_called_once_with("test query", 3)
+        finally:
+            registry._providers.pop(provider.name, None)
+
 
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""
