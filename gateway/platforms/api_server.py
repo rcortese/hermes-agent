@@ -692,15 +692,37 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
 )
 
 
+@contextmanager
+def _admitted_agent_request_reservation(adapter):
+    """Reserve one admitted-agent-request slot for the duration of the block.
+
+    Factored out of ``_admit_api_agent_request`` so routes with their own,
+    non-``_check_auth`` authorization (e.g. the Persona ask route's
+    caller-credential matrix) can still participate in the exact same
+    shutdown-drain/concurrency-cap reservation lifecycle as every
+    ``_check_auth``-gated route, without duplicating it. The mutable
+    reservation is intentionally shared with child tasks so agent/task
+    bookkeeping releases this one slot exactly once.
+    """
+    reservation = {"active": True}
+    token = _api_agent_request_reservation.set(reservation)
+    adapter._pending_agent_requests += 1
+    try:
+        yield reservation
+    finally:
+        if reservation["active"]:
+            reservation["active"] = False
+            adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        _api_agent_request_reservation.reset(token)
+
+
 def _admit_api_agent_request(handler):
     """Reserve an authenticated API turn before its handler first awaits.
 
     Gateway shutdown and aiohttp requests share an event loop. Keeping the
     drain check and reservation in one non-awaiting block prevents a request
     admitted immediately before shutdown from becoming invisible while it is
-    still parsing its body or resolving session state. The mutable reservation
-    is intentionally shared with child tasks so agent/task bookkeeping releases
-    this one slot exactly once.
+    still parsing its body or resolving session state.
     """
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
@@ -710,16 +732,8 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
-        try:
+        with _admitted_agent_request_reservation(self):
             return await handler(self, request, *args, **kwargs)
-        finally:
-            if reservation["active"]:
-                reservation["active"] = False
-                self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
-            _api_agent_request_reservation.reset(token)
 
     return _wrapped
 
@@ -1503,6 +1517,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            # Target-side Persona API (A2A v1, ask-only). Authenticated by a
+            # distinct per-caller credential matrix (gateway/persona_api.py),
+            # NOT API_SERVER_KEY -- see _handle_persona_ask.
+            ("POST", "/api/persona/ask", self._handle_persona_ask),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -4703,6 +4721,265 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+
+    # ------------------------------------------------------------------
+    # Target-side Persona API (A2A v1, ask-only)
+    # ------------------------------------------------------------------
+
+    async def _run_persona_ask(self, question: str) -> tuple:
+        """Run a bounded, tool-free one-shot answer for the Persona ask route.
+
+        Deliberately does NOT go through ``_create_agent``/``_run_agent``
+        (which resolve the api_server platform's full configured toolset):
+        "ask" is answer-only by design — an inbound persona RPC caller must
+        never be able to trigger tool execution (terminal, file, delegate,
+        etc.) on this instance. Ephemeral: no session persistence
+        (session_id=None, session_db=None), single iteration.
+
+        Returns ``(final_response_or_None, failed_bool)``.
+        """
+        loop = asyncio.get_running_loop()
+        request_profile = _api_request_profile.get()
+
+        def _run():
+            with self._profile_scope(request_profile):
+                from run_agent import AIAgent
+                from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model
+
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+                model = _resolve_gateway_model()
+                # See _create_agent: the fallback-provider runtime dict may
+                # carry its own "model", which collides with the explicit
+                # model= kwarg below unless popped first.
+                runtime_model = runtime_kwargs.pop("model", None)
+                if runtime_model:
+                    model = runtime_model
+                agent = AIAgent(
+                    model=model,
+                    **runtime_kwargs,
+                    max_iterations=1,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    ephemeral_system_prompt=(
+                        "You are answering a single question sent by another "
+                        "agent over the Persona ask RPC channel. Answer "
+                        "directly and concisely in plain text. You have no "
+                        "tools available in this context."
+                    ),
+                    enabled_toolsets=[],
+                    session_id=None,
+                    platform="api_server",
+                    session_db=None,
+                    # An inbound persona ask must never expose this host's
+                    # persistent memory (MEMORY.md/USER.md) or local project
+                    # context files (AGENTS.md/CLAUDE.md/.cursorrules/etc.) to
+                    # a remote caller -- those are host-operator-private, not
+                    # part of the target persona's identity. skip_memory and
+                    # skip_context_files are set explicitly rather than relied
+                    # on implicitly. load_soul_identity=True keeps ~/.hermes/
+                    # SOUL.md (the target persona's own identity) loading even
+                    # with skip_context_files=True, matching the precedent in
+                    # cron/scheduler.py's no-workdir job runs.
+                    skip_memory=True,
+                    skip_context_files=True,
+                    load_soul_identity=True,
+                )
+                result = agent.run_conversation(
+                    user_message=question,
+                    conversation_history=[],
+                    task_id=str(uuid.uuid4()),
+                )
+                return result.get("final_response"), bool(result.get("failed"))
+
+        # Same admission-activation + inflight accounting as _run_agent —
+        # transfers this call's reservation from "pending" to "inflight" so
+        # shutdown drain and the concurrency cap see it for the actual
+        # run duration, and releases it on every exit (return/raise/cancel).
+        self._activate_admitted_request()
+        self._inflight_agent_runs += 1
+        try:
+            return await loop.run_in_executor(None, _run)
+        finally:
+            self._inflight_agent_runs -= 1
+
+    async def _handle_persona_ask(self, request: "web.Request") -> "web.Response":
+        """POST /api/persona/ask — target-side ask-only Persona API (A2A v1).
+
+        Authorization is intentionally NOT ``self._check_auth`` (the
+        API_SERVER_KEY admin/API bearer used by every other route). It is a
+        deny-by-default caller->target->ask matrix keyed on a distinct
+        per-caller credential (gateway/persona_api.py):
+
+        - Caller identity is derived ONLY from the authenticated credential.
+        - Target identity is ONLY this server's configured ``self_target``.
+        - Any "caller"/"target"/other identity field in the request body is
+          ignored — the only body field ever read is "question".
+
+        The admin API_SERVER_KEY is explicitly rejected on this route, even
+        if it happened to collide with a configured caller token.
+
+        Despite the distinct auth, this route still participates in the same
+        drain/concurrency-cap/inflight-accounting lifecycle as every other
+        agent-serving route -- see _admitted_agent_request_reservation (the
+        reservation _admit_api_agent_request also uses), _concurrency_
+        limited_response (the shared cap), and _run_persona_ask's
+        _activate_admitted_request()/_inflight_agent_runs bookkeeping.
+
+        No run/status/stop/artifact refs — v1 is ask-only and stateless.
+        """
+        from gateway import persona_api
+
+        inbound = persona_api.load_inbound_config()
+        if inbound is None:
+            # Feature not configured — 404 rather than 401/403 so this route
+            # doesn't reveal whether Persona API is deployed at all.
+            return web.json_response(
+                _openai_error("Not found", code="not_found"), status=404,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        presented = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        if not presented:
+            return web.json_response(
+                _openai_error("Missing bearer credential", code="persona_auth_required"),
+                status=401,
+            )
+
+        # Defense in depth: the admin API_SERVER_KEY must never authorize
+        # this route, checked BEFORE the caller-credential matrix so a
+        # config accident can't grant it caller standing implicitly.
+        if self._api_key:
+            try:
+                admin_match = hmac.compare_digest(presented.encode(), self._api_key.encode())
+            except (UnicodeEncodeError, TypeError):
+                admin_match = False
+            if admin_match:
+                logger.warning(
+                    "Persona ask rejected: admin API key presented on persona route: %s",
+                    self._request_audit_log_suffix(request),
+                )
+                persona_api.audit_log("ask", target_id=inbound.self_target, outcome="admin_key_rejected")
+                return web.json_response(
+                    _openai_error("Invalid credential for this route", code="persona_admin_key_rejected"),
+                    status=401,
+                )
+
+        caller_id = persona_api.resolve_caller(inbound, presented)
+        if caller_id is None:
+            persona_api.audit_log("ask", target_id=inbound.self_target, outcome="invalid_credential")
+            return web.json_response(
+                _openai_error("Invalid credential", code="persona_invalid_credential"),
+                status=401,
+            )
+
+        if not persona_api.is_ask_authorized(inbound, caller_id):
+            persona_api.audit_log(
+                "ask", caller_id=caller_id, target_id=inbound.self_target, outcome="denied",
+            )
+            return web.json_response(
+                _openai_error("Not authorized for this target", code="persona_denied"),
+                status=403,
+            )
+
+        correlation_id = persona_api.new_correlation_id()
+
+        # Same graceful-shutdown posture as every other agent-invoking route
+        # (see _admit_api_agent_request): drain check and reservation live in
+        # one non-awaiting block right after auth, so an admitted request
+        # can't become invisible to shutdown while it parses its body.
+        # Checked manually rather than via that decorator because its first
+        # step is self._check_auth (the admin API_SERVER_KEY), which must
+        # never run on this route.
+        draining = self._draining_response()
+        if draining is not None:
+            return draining
+
+        with _admitted_agent_request_reservation(self):
+            # Bound total in-flight agent runs — same shared cap and response
+            # semantics as every other agent-serving endpoint (#7483).
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
+
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response(
+                    _openai_error("Invalid JSON", code="invalid_json"), status=400,
+                )
+            if not isinstance(body, dict):
+                return web.json_response(
+                    _openai_error("Body must be a JSON object", code="invalid_request"), status=400,
+                )
+
+            # Closed request contract: ONLY "question" is read. Any other field
+            # — including a spoofed "caller"/"target" — is silently ignored.
+            question = body.get("question")
+            if not isinstance(question, str) or not question.strip():
+                return web.json_response(
+                    _openai_error("Missing 'question'", code="missing_question"), status=400,
+                )
+            question = question.strip()[: persona_api.MAX_QUESTION_CHARS]
+
+            try:
+                raw_answer, failed = await self._run_persona_ask(question)
+            except Exception:
+                logger.exception(
+                    "Persona ask failed for caller=%s target=%s", caller_id, inbound.self_target,
+                )
+                persona_api.audit_log(
+                    "ask", caller_id=caller_id, target_id=inbound.self_target,
+                    correlation_id=correlation_id, outcome="error",
+                )
+                return web.json_response(
+                    persona_api.build_receipt(
+                        status="error", target=inbound.self_target, correlation_id=correlation_id,
+                        error_code="ask_failed", message="Failed to produce an answer.",
+                    ),
+                    status=502,
+                )
+
+            if failed or not raw_answer:
+                persona_api.audit_log(
+                    "ask", caller_id=caller_id, target_id=inbound.self_target,
+                    correlation_id=correlation_id, outcome="incomplete",
+                )
+                return web.json_response(
+                    persona_api.build_receipt(
+                        status="error", target=inbound.self_target, correlation_id=correlation_id,
+                        error_code="ask_incomplete", message="No answer was produced.",
+                    ),
+                    status=502,
+                )
+
+            # Fail-closed redaction: if redaction itself errors, do not return
+            # the raw answer — return a generic failure instead.
+            answer_text = persona_api.safe_redact(raw_answer)
+            if answer_text is None:
+                persona_api.audit_log(
+                    "ask", caller_id=caller_id, target_id=inbound.self_target,
+                    correlation_id=correlation_id, outcome="redaction_failed",
+                )
+                return web.json_response(
+                    persona_api.build_receipt(
+                        status="error", target=inbound.self_target, correlation_id=correlation_id,
+                        error_code="redaction_failed", message="Answer could not be safely returned.",
+                    ),
+                    status=502,
+                )
+            answer_text = answer_text[: persona_api.MAX_ANSWER_CHARS]
+
+            persona_api.audit_log(
+                "ask", caller_id=caller_id, target_id=inbound.self_target,
+                correlation_id=correlation_id, outcome="ok",
+            )
+            return web.json_response(
+                persona_api.build_receipt(
+                    status="ok", target=inbound.self_target, correlation_id=correlation_id,
+                    answer_text=answer_text,
+                ),
+                status=200,
+            )
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

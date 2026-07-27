@@ -364,6 +364,9 @@ def _is_hermes_internal_secret(key: str) -> bool:
       ``_ALWAYS_STRIP_KEYS``. Non-secret ``GATEWAY_RELAY_*`` routing hints
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
+    - ``PERSONA_CALLER_*_TOKEN`` / ``PERSONA_TARGET_*_TOKEN`` — Persona API
+      (A2A) credentials: per-caller inbound-auth tokens and per-target
+      outbound RPC credentials, resolved by ``gateway/persona_api.py``.
 
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
@@ -384,6 +387,10 @@ def _is_hermes_internal_secret(key: str) -> bool:
         return True
     if upper.startswith("GATEWAY_RELAY_") and (
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
+    ):
+        return True
+    if (upper.startswith("PERSONA_CALLER_") or upper.startswith("PERSONA_TARGET_")) and (
+        upper.endswith("_TOKEN") or upper.endswith("_KEY") or upper.endswith("_SECRET")
     ):
         return True
     return False
@@ -529,6 +536,10 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HASS_TOKEN",
     "EMAIL_PASSWORD",
     "HERMES_DASHBOARD_SESSION_TOKEN",
+    # API server admin credential — grants full agent API access; no
+    # legitimate child Hermes spawn needs it, same tier as the bot tokens
+    # above.
+    "API_SERVER_KEY",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",

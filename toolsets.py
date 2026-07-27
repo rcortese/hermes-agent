@@ -278,6 +278,17 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "persona": {
+        "description": (
+            "Ask-only Persona-to-persona (A2A) RPC — ask another configured "
+            "Hermes persona a question. Target routing and credentials are "
+            "fixed by server-side config (persona_api.outbound.targets); "
+            "only active when at least one outbound target is configured."
+        ),
+        "tools": ["persona_rpc"],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

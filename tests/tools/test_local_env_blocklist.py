@@ -16,6 +16,7 @@ import pytest
 
 from tools.environments.local import (
     LocalEnvironment,
+    _ALWAYS_STRIP_KEYS,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
 )
@@ -761,3 +762,67 @@ class TestHermesInternalDynamicSecrets:
         assert "GATEWAY_RELAY_SECRET" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_DELIVERY_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_ID" in _HERMES_PROVIDER_ENV_BLOCKLIST
+
+
+class TestPersonaApiCredentialStripping:
+    """Persona API (A2A) credentials must never reach a spawned subprocess.
+
+    ``API_SERVER_KEY`` is the admin/API credential for this instance's own
+    api_server; ``PERSONA_CALLER_*_TOKEN`` / ``PERSONA_TARGET_*_TOKEN`` are
+    per-caller inbound and per-target outbound Persona RPC credentials
+    (gateway/persona_api.py). All three are Tier-1 gateway secrets, not LLM
+    provider credentials, so no legitimate child Hermes spawn needs them.
+    """
+
+    def test_api_server_key_is_always_stripped(self):
+        assert "API_SERVER_KEY" in _ALWAYS_STRIP_KEYS
+
+    def test_api_server_key_stripped_from_terminal_subprocess(self):
+        result_env = _run_with_env(extra_os_env={"API_SERVER_KEY": "sk-api-server-admin-secret"})
+        assert "API_SERVER_KEY" not in result_env
+
+    def test_api_server_key_stripped_even_with_credential_inheritance(self):
+        """Tier-1 strip applies unconditionally — even for the inherit_credentials=True
+        path used by model-driving CLIs (claude/codex/gemini), which skips the
+        Tier-2 provider blocklist."""
+        from tools.environments.local import hermes_subprocess_env
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "API_SERVER_KEY": "sk-api-server-admin-secret",
+        }, clear=True):
+            env = hermes_subprocess_env(inherit_credentials=True)
+        assert "API_SERVER_KEY" not in env
+
+    def test_predicate_matches_persona_caller_and_target_tokens(self):
+        from tools.environments.local import _is_hermes_internal_secret
+        assert _is_hermes_internal_secret("PERSONA_CALLER_MERCURY_TOKEN")
+        assert _is_hermes_internal_secret("PERSONA_TARGET_BOB_TOKEN")
+        assert _is_hermes_internal_secret("PERSONA_CALLER_MY_OTHER_CALLER_TOKEN")
+
+    def test_predicate_allows_persona_non_secret_fields(self):
+        """Only the credential suffix is matched — an id/name field with a
+        PERSONA_ prefix but no secret suffix must stay visible."""
+        from tools.environments.local import _is_hermes_internal_secret
+        assert not _is_hermes_internal_secret("PERSONA_CALLER_MERCURY_ID")
+        assert not _is_hermes_internal_secret("PERSONA_TARGET_BOB_URL")
+
+    def test_persona_credentials_stripped_from_subprocess(self):
+        result_env = _run_with_env(extra_os_env={
+            "PERSONA_CALLER_MERCURY_TOKEN": "caller-secret-value",
+            "PERSONA_TARGET_BOB_TOKEN": "target-secret-value",
+            "PERSONA_TARGET_BOB_URL": "https://bob.example.com",
+        })
+        assert "PERSONA_CALLER_MERCURY_TOKEN" not in result_env
+        assert "PERSONA_TARGET_BOB_TOKEN" not in result_env
+        # Non-secret routing hint is preserved.
+        assert result_env.get("PERSONA_TARGET_BOB_URL") == "https://bob.example.com"
+
+    def test_persona_credentials_stripped_even_when_passthrough_registered(self):
+        with patch(
+            "tools.env_passthrough.is_env_passthrough",
+            side_effect=lambda name: name == "PERSONA_CALLER_MERCURY_TOKEN",
+        ):
+            result_env = _run_with_env(extra_os_env={
+                "PERSONA_CALLER_MERCURY_TOKEN": "caller-secret-value",
+            })
+        assert "PERSONA_CALLER_MERCURY_TOKEN" not in result_env
