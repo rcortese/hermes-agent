@@ -1071,10 +1071,15 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
-Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+ Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Use foreground for any bounded command whose result is needed for the current turn's next decision, provided it fits the 600-second foreground limit. Expected duration alone does not justify background when bounded work fits within that limit — set a generous timeout and the call still returns as soon as the command finishes.
+ Background: Set background=true only for a long-lived process, work that may exceed the 600-second foreground limit, or work that is semantically independent of the current turn. Do not use background followed by process(action="wait") merely to simulate foreground execution. Bounded background work MUST set notify_on_complete=true; without it, completion is silent unless you poll. Long-lived servers/watchers may stay silent when exit notification has no value.
+For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
+After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
+Use process(action="poll") for progress checks, process(action="wait") to block until done.
+Working directory: Use 'workdir' for per-command cwd.
+PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
+ 
+Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
 
 # Global state for environment lifecycle management
@@ -3348,7 +3353,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                 "description": "Run the command in the background only for a long-lived process, work that may exceed the 600-second foreground limit, or work that is semantically independent of the current turn. Use foreground when the result is needed for the current turn's next decision. Expected duration alone does not justify background when bounded work fits within that limit. Do not use background followed by process(action=\"wait\") merely to simulate foreground execution. Bounded background work MUST set notify_on_complete=true; long-lived servers/watchers may stay silent when exit notification has no value.",
                 "default": False
             },
             "timeout": {
