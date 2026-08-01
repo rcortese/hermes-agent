@@ -1078,7 +1078,7 @@ After starting a server, verify readiness with a health check or log signal, the
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
- 
+
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
 

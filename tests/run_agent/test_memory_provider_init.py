@@ -80,18 +80,40 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
             skip_context_files=True,
             skip_memory=False,
             session_id="sess-alt",
-            platform="feishu",
+            platform="telegram",
             user_id="open-id",
             user_id_alt="union-id",
         )
 
     assert agent._memory_manager is not None
     assert provider.init_session_id == "sess-alt"
+    assert provider.init_kwargs is not None
     assert provider.init_kwargs["user_id"] == "open-id"
     assert provider.init_kwargs["user_id_alt"] == "union-id"
-    assert provider.init_kwargs["platform"] == "feishu"
+    assert provider.init_kwargs["platform"] == "telegram"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+def test_memory_is_fail_closed_outside_direct_human_surfaces():
+    from agent.agent_init import _should_skip_memory_for_runtime
+
+    cleared_flags = {
+        "HERMES_SAFE_MODE": "",
+        "HERMES_IGNORE_RULES": "",
+        "HERMES_IGNORE_USER_CONFIG": "",
+    }
+    with patch.dict("os.environ", cleared_flags, clear=False):
+        assert _should_skip_memory_for_runtime(platform="telegram") is False
+        assert _should_skip_memory_for_runtime(platform="webui") is False
+        for platform in ("feishu", "api_server", "cli", "cron", "desktop", None):
+            assert _should_skip_memory_for_runtime(platform=platform) is True
+        assert _should_skip_memory_for_runtime(
+            platform="telegram", explicit_skip_memory=True
+        ) is True
+
+    with patch.dict("os.environ", {"HERMES_SAFE_MODE": "1"}, clear=False):
+        assert _should_skip_memory_for_runtime(platform="telegram") is True
 
 
 class CoreShadowProvider:
