@@ -52,6 +52,17 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def test_auth_home_override_is_independent_from_runtime_home(tmp_path, monkeypatch):
+    from hermes_cli.auth import _auth_file_path
+
+    runtime_home = tmp_path / "runtime"
+    auth_home = tmp_path / "shared-auth"
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(auth_home))
+
+    assert _auth_file_path() == auth_home / "auth.json"
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------

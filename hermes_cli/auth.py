@@ -479,15 +479,31 @@ def _nonempty_str(value: Any) -> bool:
 # ── Auth Store — persistence layer for ~/.hermes/auth.json ──────────────────────────────────────────
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
-    # Seat belt: under pytest, refuse to touch the real user's auth store (tests that forgot to
-    # monkeypatch HERMES_HOME or escaped the hermetic conftest). In production: one dict lookup.
-    if (os.environ.get("PYTEST_CURRENT_TEST")
-            and _same_path(path, Path.home() / ".hermes" / "auth.json")):
-        raise RuntimeError(
-            f"Refusing to touch real user auth store during test run: {path}. "
-            "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-            "via scripts/run_tests.sh for hermetic CI-parity env.")
+    auth_home_override = os.getenv("HERMES_AUTH_HOME", "").strip()
+    auth_root = (
+        Path(auth_home_override).expanduser()
+        if auth_home_override
+        else get_hermes_home()
+    )
+    path = auth_root / "auth.json"
+    # Seat belt: if pytest is running and the resolved auth store points at the
+    # real user's auth file, refuse rather than silently corrupt it. This catches
+    # tests that forgot to monkeypatch HERMES_HOME/HERMES_AUTH_HOME, tests invoked
+    # without the hermetic conftest, or sandbox escapes via threads/subprocesses.
+    # In production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+        if resolved == real_home_auth:
+            raise RuntimeError(
+                f"Refusing to touch real user auth store during test run: {path}. "
+                "Set HERMES_HOME or HERMES_AUTH_HOME to a tmp_path in your "
+                "test fixture, or run "
+                "via scripts/run_tests.sh for hermetic CI-parity env."
+            )
     return path
 
 
@@ -495,6 +511,9 @@ def _global_auth_file_path() -> Optional[Path]:
     """Global-root auth.json in profile mode; None when profile and global root are the same dir.
 
     Read-only fallback path, so no pytest seat belt here (it lives on ``_auth_file_path()``)."""
+    if os.getenv("HERMES_AUTH_HOME", "").strip():
+        # Explicit fleet store is the sole authority; never borrow profile/global grants.
+        return None
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
