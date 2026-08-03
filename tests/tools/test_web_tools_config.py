@@ -15,6 +15,17 @@ import sys
 import types
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
+from agent.web_search_provider import WebSearchProvider
+from agent.web_search_registry import register_provider
+
+
+class _CustomFallbackProvider(WebSearchProvider):
+    @property
+    def name(self):
+        return "custom-live"
+
+    def is_available(self):
+        return True
 
 
 class TestFirecrawlClientConfig:
@@ -378,6 +389,89 @@ class TestWebSearchErrorHandling:
         assert "exception_type" not in result
         assert "exception_chain" not in result
         assert "traceback" not in result
+
+    def test_search_uses_configured_fallback_after_primary_exception(self):
+        import tools.web_tools
+
+        primary = MagicMock()
+        primary.name = "firecrawl"
+        primary.supports_search.return_value = True
+        primary.search.side_effect = RuntimeError("primary down")
+        fallback = MagicMock()
+        fallback.name = "brave-free"
+        fallback.supports_search.return_value = True
+        fallback.search.return_value = {
+            "success": True,
+            "data": {"web": []},
+            "metadata": {"backend": "stale-provider"},
+        }
+
+        def provider_for(name):
+            return {"firecrawl": primary, "brave-free": fallback}.get(name)
+
+        with patch("tools.web_tools._get_search_backend", return_value="firecrawl"), \
+             patch("tools.web_tools._get_search_fallback_backends", return_value=["brave-free"]), \
+             patch("tools.web_tools._is_backend_available", return_value=True), \
+             patch("agent.web_search_registry.get_provider", side_effect=provider_for), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+        assert result["success"] is True
+        assert result["metadata"]["backend"] == "brave-free"
+        assert result["metadata"]["fallback_from"] == "firecrawl"
+        assert result["metadata"]["fallback_failures"] == ["firecrawl: primary down"]
+        primary.search.assert_called_once_with("test query", 3)
+        fallback.search.assert_called_once_with("test query", 3)
+
+    def test_fallback_names_are_normalized_and_deduplicated(self):
+        from tools.web_tools import _normalize_backend_names
+
+        assert _normalize_backend_names(" brave-free,BRAVE-FREE;ddgs,unknown ") == [
+            "brave-free",
+            "ddgs",
+        ]
+
+    def test_configured_live_provider_fallback_executes_after_primary_failure(self):
+        """A plugin provider admitted by the live registry survives the real
+        web.search_fallback_backends config path and executes after failure.
+
+        This must fail if custom registry names are removed from fallback
+        normalization, even though the provider object is otherwise available.
+        """
+        import agent.web_search_registry as registry
+        import tools.web_tools
+
+        provider = _CustomFallbackProvider()
+        provider.supports_search = MagicMock(return_value=True)
+        provider.search = MagicMock(return_value={"success": True, "data": {"web": []}})
+        primary = MagicMock()
+        primary.name = "firecrawl"
+        primary.supports_search.return_value = True
+        primary.search.side_effect = RuntimeError("primary down")
+        register_provider(provider)
+        try:
+            def provider_for(name):
+                return {"firecrawl": primary, "custom-live": provider}.get(name)
+
+            with patch("tools.web_tools._get_search_backend", return_value="firecrawl"), \
+                 patch("tools.web_tools._load_web_config", return_value={
+                     "search_fallback_backends": ["custom-live"],
+                 }), \
+                 patch("agent.web_search_registry.get_provider", side_effect=provider_for), \
+                 patch("tools.interrupt.is_interrupted", return_value=False), \
+                 patch.object(tools.web_tools._debug, "log_call"), \
+                 patch.object(tools.web_tools._debug, "save"):
+                result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+            assert result["success"] is True
+            assert result["metadata"]["backend"] == "custom-live"
+            assert result["metadata"]["fallback_from"] == "firecrawl"
+            primary.search.assert_called_once_with("test query", 3)
+            provider.search.assert_called_once_with("test query", 3)
+        finally:
+            registry._providers.pop(provider.name, None)
 
 
 class TestCheckWebApiKey:
