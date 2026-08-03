@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 class RecordingMemoryProvider:
     name = "recording"
@@ -80,18 +82,50 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
             skip_context_files=True,
             skip_memory=False,
             session_id="sess-alt",
-            platform="feishu",
+            platform="telegram",
             user_id="open-id",
             user_id_alt="union-id",
         )
 
     assert agent._memory_manager is not None
     assert provider.init_session_id == "sess-alt"
+    assert provider.init_kwargs is not None
     assert provider.init_kwargs["user_id"] == "open-id"
     assert provider.init_kwargs["user_id_alt"] == "union-id"
-    assert provider.init_kwargs["platform"] == "feishu"
+    assert provider.init_kwargs["platform"] == "telegram"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_skip"),
+    [
+        ("telegram", False),
+        ("webui", False),
+        ("feishu", True),
+        ("api_server", True),
+        ("cli", True),
+        ("cron", True),
+        ("desktop", True),
+        (None, True),
+    ],
+)
+def test_memory_is_fail_closed_outside_direct_human_surfaces(platform, expected_skip):
+    from agent.agent_init import _should_skip_memory_for_runtime
+
+    cleared_flags = {
+        "HERMES_SAFE_MODE": "",
+        "HERMES_IGNORE_RULES": "",
+        "HERMES_IGNORE_USER_CONFIG": "",
+    }
+    with patch.dict("os.environ", cleared_flags, clear=False):
+        assert _should_skip_memory_for_runtime(platform=platform) is expected_skip
+        assert _should_skip_memory_for_runtime(
+            platform="telegram", explicit_skip_memory=True
+        ) is True
+
+    with patch.dict("os.environ", {"HERMES_SAFE_MODE": "1"}, clear=False):
+        assert _should_skip_memory_for_runtime(platform="telegram") is True
 
 
 class CoreShadowProvider:
