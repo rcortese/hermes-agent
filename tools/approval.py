@@ -2733,6 +2733,228 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
+_SMART_FLOOR_CONFIG_TARGET_RE = re.compile(
+    rf"(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH}|"
+    rf"{_PROJECT_SENSITIVE_WRITE_TARGET}|(?:.*/)?compose\.ya?ml)",
+    re.IGNORECASE,
+)
+
+
+def _is_smart_floor_config_target(token: str) -> bool:
+    """Return whether one unquoted shell token names floor-sensitive config."""
+    return bool(_SMART_FLOOR_CONFIG_TARGET_RE.fullmatch(token))
+
+
+def _short_or_long_option_present(args: list[str], short: str, long: str) -> bool:
+    """Recognize a short option in a bundle or its long spelling."""
+    for token in args:
+        if token == "--":
+            break
+        if token == long or token.startswith(f"{long}="):
+            return True
+        if token.startswith("-") and not token.startswith("--") and short in token[1:]:
+            return True
+    return False
+
+
+def _command_operands(
+    args: list[str],
+    *,
+    short_options_with_values: frozenset[str] = frozenset(),
+    long_options_with_values: frozenset[str] = frozenset(),
+) -> tuple[list[str], list[str]]:
+    """Return (operands, target-directory values) for simple file utilities.
+
+    This is intentionally an argv parser, not a shell parser: the existing shell
+    lexer has already bounded and unquoted the command.  Options that own values
+    are removed so a source/reference value is never mistaken for a destination.
+    ``-t``/``--target-directory`` values are returned separately because they
+    are destinations even though they are option arguments.
+    """
+    operands: list[str] = []
+    target_directories: list[str] = []
+    options = True
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if options and token == "--":
+            options = False
+            index += 1
+            continue
+        if options and token.startswith("--"):
+            option, separator, attached = token.partition("=")
+            if option in long_options_with_values:
+                if separator:
+                    value = attached
+                elif index + 1 < len(args):
+                    index += 1
+                    value = args[index]
+                else:
+                    value = ""
+                if option == "--target-directory" and value:
+                    target_directories.append(value)
+                index += 1
+                continue
+            index += 1
+            continue
+        if options and token.startswith("-") and token != "-":
+            chars = token[1:]
+            value_option_at = next(
+                (at for at, char in enumerate(chars) if char in short_options_with_values),
+                None,
+            )
+            if value_option_at is not None:
+                option = chars[value_option_at]
+                attached = chars[value_option_at + 1 :]
+                if attached:
+                    value = attached
+                elif index + 1 < len(args):
+                    index += 1
+                    value = args[index]
+                else:
+                    value = ""
+                if option == "t" and value:
+                    target_directories.append(value)
+            index += 1
+            continue
+        operands.append(token)
+        index += 1
+    return operands, target_directories
+
+
+def _inplace_edit_targets(executable: str, args: list[str]) -> list[str]:
+    """Return file operands, excluding sed/perl/ruby programs and option values."""
+    if executable == "sed":
+        short_program_options = frozenset({"e", "f"})
+        long_program_options = frozenset({"--expression", "--file"})
+    else:
+        short_program_options = frozenset({"e", "E"})
+        long_program_options = frozenset()
+    operands, _ = _command_operands(
+        args,
+        short_options_with_values=short_program_options,
+        long_options_with_values=long_program_options,
+    )
+    has_explicit_program = any(
+        _short_or_long_option_present(args, short, long)
+        for short, long in (
+            (("e", "--expression"), ("f", "--file"))
+            if executable == "sed"
+            else (("e", "--unused"), ("E", "--unused"))
+        )
+    )
+    return operands if has_explicit_program else operands[1:]
+
+
+def _smart_floor_config_write(command: str) -> bool:
+    """Detect proven writes to config that controls the running agent/project."""
+    for segment in _iter_top_level_shell_segments(command):
+        # Redirection is shell syntax rather than an executable's argv.  The
+        # lexer separates both attached and spaced > / >> forms from the target.
+        segment_tokens = _shell_segment_tokens(segment, 0)
+        if segment_tokens is not None:
+            for index, token in enumerate(segment_tokens[:-1]):
+                if token in {">", ">>"} and _is_smart_floor_config_target(
+                    segment_tokens[index + 1]
+                ):
+                    return True
+
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = os.path.basename(
+                _deobfuscate_shell_word_for_detection(word)
+            ).lower()
+            if executable not in {"tee", "sed", "perl", "ruby", "cp", "mv", "install", "truncate"}:
+                continue
+            tokens = _shell_segment_tokens(segment, start)
+            if not tokens:
+                continue
+            args = tokens[1:]
+
+            if executable == "tee":
+                operands, _ = _command_operands(args)
+                if any(_is_smart_floor_config_target(path) for path in operands):
+                    return True
+                continue
+
+            if executable in {"sed", "perl", "ruby"}:
+                if _short_or_long_option_present(args, "i", "--in-place") and any(
+                    _is_smart_floor_config_target(path)
+                    for path in _inplace_edit_targets(executable, args)
+                ):
+                    return True
+                continue
+
+            if executable in {"cp", "mv"}:
+                operands, target_directories = _command_operands(
+                    args,
+                    short_options_with_values=frozenset({"S", "t"}),
+                    long_options_with_values=frozenset(
+                        {"--suffix", "--target-directory"}
+                    ),
+                )
+                destinations = target_directories or operands[-1:]
+                if any(_is_smart_floor_config_target(path) for path in destinations):
+                    return True
+                continue
+
+            if executable == "install":
+                operands, target_directories = _command_operands(
+                    args,
+                    short_options_with_values=frozenset({"g", "m", "o", "S", "t"}),
+                    long_options_with_values=frozenset(
+                        {
+                            "--group",
+                            "--mode",
+                            "--owner",
+                            "--suffix",
+                            "--target-directory",
+                        }
+                    ),
+                )
+                directory_mode = _short_or_long_option_present(args, "d", "--directory")
+                destinations = target_directories or (operands if directory_mode else operands[-1:])
+                if any(_is_smart_floor_config_target(path) for path in destinations):
+                    return True
+                continue
+
+            operands, _ = _command_operands(
+                args,
+                short_options_with_values=frozenset({"r", "s"}),
+                long_options_with_values=frozenset({"--reference", "--size"}),
+            )
+            if any(_is_smart_floor_config_target(path) for path in operands):
+                return True
+    return False
+
+
+def _smart_manual_floor_reason(command: str) -> Optional[str]:
+    """Return the narrow classes that always require a human decision.
+
+    This is an escalation to the ordinary approval flow, not a hard block.
+    Keep the floor deliberately smaller than the dangerous-command detector so
+    smart approval and bypass modes remain useful for ordinary operations.
+    """
+    patterns = (
+        (
+            r"\b(?:curl|wget|git|gh|ssh|docker|hermes|kanban|echo|printf|cat|base64|base32|base16|xxd)\b"
+            r"[^\n|;&]*\|(?:[^\n|;&]*\|)?\s*(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b",
+            "manual_floor:pipe_to_interpreter",
+        ),
+        (
+            r"\bgit\s+push\b[^\n;&]*(?:--force(?:-with-lease)?|-f\b|--delete\b|:\S+)",
+            "manual_floor:git_history_remote",
+        ),
+    )
+    for command_variant in _command_detection_variants(command):
+        for pattern, reason in patterns:
+            if re.search(pattern, command_variant, re.IGNORECASE | re.DOTALL):
+                return reason
+        if _smart_floor_config_write(command_variant):
+            return "manual_floor:env_config_write"
+
+    return None
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -3381,7 +3603,12 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # Hardline floor: unconditional block for catastrophic commands
+    # Compute the manual floor here, before bypass,
+    # permanent-allowlist, and non-interactive shortcuts. This keeps the
+    # safety floor on the public guard flow while ordinary smart wrappers still
+    # use the observer/telemetry path below.
+    approval_mode = _get_approval_mode()
+    manual_floor_reason = _smart_manual_floor_reason(command)
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
     # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
     # no session-level setting can bypass it.
@@ -3412,11 +3639,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        manual_floor_reason is None
+        and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off")
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if manual_floor_reason is None and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3425,7 +3654,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if manual_floor_reason is None and not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -3561,6 +3790,9 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
+    if manual_floor_reason is not None:
+        warnings.append((manual_floor_reason, manual_floor_reason, False))
+
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
@@ -3570,7 +3802,9 @@ def check_all_command_guards(command: str, env_type: str,
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and manual_floor_reason:
+        logger.info("Smart approval escalated to human approval: %s", manual_floor_reason)
+    elif approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,

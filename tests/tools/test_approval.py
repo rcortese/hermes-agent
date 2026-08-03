@@ -14,6 +14,7 @@ from hermes_constants import get_hermes_home
 from tools.approval import (
     _get_approval_mode,
     _normalize_approval_mode,
+    _smart_manual_floor_reason,
     _smart_approve,
     approve_session,
     detect_dangerous_command,
@@ -81,6 +82,86 @@ class TestSmartApproval:
         assert result["approved"] is True
         assert result["smart_approved"] is True
         assert is_approved(session_key, pattern_key) is False
+
+
+
+
+class TestManualFloorPublicFlow:
+    @pytest.mark.parametrize(
+        ("command", "reason"),
+        [
+            ("git push --delete origin old", "manual_floor:git_history_remote"),
+            ("git push origin :old", "manual_floor:git_history_remote"),
+            ("echo payload | base64 -d | bash", "manual_floor:pipe_to_interpreter"),
+            ("xxd -r payload | bash", "manual_floor:pipe_to_interpreter"),
+            ("printf x > ~/.hermes/config.yaml", "manual_floor:env_config_write"),
+            ("printf x >> compose.yaml", "manual_floor:env_config_write"),
+            ("printf x | tee config.yaml", "manual_floor:env_config_write"),
+            ("sed -i 's/a/b/' compose.yaml", "manual_floor:env_config_write"),
+            ("perl -pi -e 's/a/b/' ~/.hermes/config.yaml", "manual_floor:env_config_write"),
+            ("ruby -i -pe 'gsub(/a/, \"b\")' .env", "manual_floor:env_config_write"),
+            ("cp template.yaml compose.yaml", "manual_floor:env_config_write"),
+            ("mv generated.yaml config.yaml", "manual_floor:env_config_write"),
+            ("install -m 600 template.env .env", "manual_floor:env_config_write"),
+            ("truncate -s 0 ~/.hermes/config.yaml", "manual_floor:env_config_write"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("shortcut", "approval_mode", "yolo", "interactive", "allowlisted"),
+        [
+            ("yolo", "smart", True, True, False),
+            ("off", "off", False, True, False),
+            ("allowlist", "smart", False, True, True),
+            ("noninteractive", "smart", False, False, False),
+        ],
+    )
+    def test_floor_is_reached_before_shortcuts(
+        self,
+        command,
+        reason,
+        shortcut,
+        approval_mode,
+        yolo,
+        interactive,
+        allowlisted,
+        monkeypatch,
+    ):
+        assert _smart_manual_floor_reason(command) == reason
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: approval_mode)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", yolo)
+        monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: interactive)
+        monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(
+            approval_module,
+            "_command_matches_permanent_allowlist",
+            lambda _: allowlisted,
+        )
+        monkeypatch.setattr(approval_module, "_fire_approval_hook", lambda *args, **kwargs: None)
+        result = approval_module.check_all_command_guards(
+            command,
+            "local",
+            approval_callback=lambda **kwargs: "deny",
+        )
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -lc 'printf ok'",
+            "rm -rf /tmp/test-cache",
+            "git status",
+            "sed -n '1,20p' compose.yaml",
+            "cat ~/.hermes/config.yaml",
+            "grep approvals ~/.hermes/config.yaml",
+            "git diff -- compose.yaml",
+            "cp config.yaml backup.yaml",
+            "sed -i compose.yaml notes.txt",
+            "perl -i -e compose.yaml notes.txt",
+        ],
+    )
+    def test_low_signal_commands_stay_outside_floor(self, command):
+        assert _smart_manual_floor_reason(command) is None
 
 
 class TestDetectDangerousRm:
