@@ -3319,6 +3319,52 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
+def _smart_manual_floor_reason(command: str, description: str) -> Optional[str]:
+    """Return the narrow classes that smart mode must send to a human.
+
+    This is an escalation to the ordinary approval flow, not a hard block.
+    Keep the floor deliberately smaller than the dangerous-command detector so
+    smart approval remains useful for ordinary wrappers and temporary cleanup.
+    """
+    command_lc = (command or "").lower()
+    description_lc = (description or "").lower()
+
+    pipe_to_interpreter = re.search(
+        r"\b(?:curl|wget|git|gh|ssh|docker|hermes|kanban|echo|base64|base32|base16|xxd)\b[^\n|;&]*"
+        r"\|\s*(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b",
+        command_lc,
+    )
+    decoded_pipe_to_interpreter = re.search(
+        r"\b(?:echo|printf|cat)\b[^\n|;&]*\|\s*"
+        r"(?:base64|base32|base16)\b[^\n|;&]*\|\s*"
+        r"(?:[/\w.-]*/)?(?:python[23]?|perl|ruby|node|(?:ba)?sh)\b",
+        command_lc,
+    )
+    if pipe_to_interpreter or decoded_pipe_to_interpreter or "pipe to interpreter" in description_lc:
+        return "manual_floor:pipe_to_interpreter"
+
+    remote_history_mutation = re.search(
+        r"\bgit\s+push\b.*(?:--force(?:-with-lease)?|-f\b|--delete\b|:\S+)",
+        command_lc,
+    )
+    if remote_history_mutation or "force push" in description_lc or "remote branch deletion" in description_lc:
+        return "manual_floor:git_history_remote"
+
+    config_or_env_path = re.search(
+        r"(?:\.hermes/(?:config\.yaml|\.env)|(?:^|[/\s])\.env(?:$|[\s'\"]|/)|"
+        r"(?:^|[/\s])config\.yaml(?:$|[\s'\"]|/)|compose\.ya?ml)",
+        command_lc,
+    )
+    write_verb = re.search(r"\b(?:tee|sed|perl|ruby|cp|mv|install|truncate)\b|>>?", command_lc)
+    if (config_or_env_path and write_verb) or any(
+        phrase in description_lc
+        for phrase in ("hermes config/env", "project env/config", "overwrite project env/config")
+    ):
+        return "manual_floor:env_config_write"
+
+    return None
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -4358,7 +4404,16 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # Hardline floor: unconditional block for catastrophic commands
+    # Compute the smart-approval manual floor here, before bypass,
+    # permanent-allowlist, and non-interactive shortcuts. This keeps the
+    # safety floor on the public guard flow while ordinary smart wrappers still
+    # use the observer/telemetry path below.
+    approval_mode = _get_approval_mode()
+    manual_floor_reason = (
+        _smart_manual_floor_reason(command, "")
+        if approval_mode == "smart"
+        else None
+    )
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
     # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
     # no session-level setting can bypass it.
@@ -4389,11 +4444,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        manual_floor_reason is None
+        and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off")
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if manual_floor_reason is None and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -4414,7 +4471,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if manual_floor_reason is None and not is_cli and not is_gateway and not is_ask:
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
@@ -4618,6 +4675,9 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
+    if manual_floor_reason is not None:
+        warnings.append((manual_floor_reason, manual_floor_reason, False))
+
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
@@ -4629,43 +4689,47 @@ def check_all_command_guards(command: str, env_type: str,
     smart_denied_for_owner = False
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        observer_payload = _prepare_smart_approval_observer(
-            command=command,
-            description=combined_desc_for_llm,
-            pattern_key=warnings[0][0],
-            pattern_keys=[key for key, _, _ in warnings],
-            session_key=session_key,
-        )
-        verdict = _smart_approve(command, combined_desc_for_llm)
-        _observe_smart_approval_verdict(observer_payload, verdict)
-        if verdict == "approve":
-            # Approve this command only. Pattern-level persistence would let one
-            # benign command suppress review of later commands that happen to
-            # match the same broad detector category.
-            _reset_denials(session_key)
-            logger.debug("Smart approval: auto-approved '%s' (%s)",
-                         command[:60], combined_desc_for_llm)
-            return {"approved": True, "message": None,
-                    "smart_approved": True,
-                    "description": combined_desc_for_llm}
-        elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
-            _record_denial(session_key)
-            breaker_addendum = _denial_breaker_addendum(session_key)
-            return {
-                "approved": False,
-                "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
-                           "The command was assessed as genuinely dangerous. "
-                           f"Do NOT retry.{breaker_addendum}",
-                "smart_denied": True,
-            }
-        elif verdict == "deny":
-            # Guardian DENY that falls through to a one-operation human
-            # override still counts toward the consecutive-denial breaker;
-            # a subsequent human approval resets the tally below.
-            _record_denial(session_key)
-            smart_denied_for_owner = True
-        # An interactive owner may override DENY for this operation only.
-        # ESCALATE follows the normal, potentially persistent manual behavior.
+        manual_floor_reason = _smart_manual_floor_reason(command, combined_desc_for_llm)
+        if manual_floor_reason:
+            logger.info("Smart approval escalated to human approval: %s", manual_floor_reason)
+        else:
+            observer_payload = _prepare_smart_approval_observer(
+                command=command,
+                description=combined_desc_for_llm,
+                pattern_key=warnings[0][0],
+                pattern_keys=[key for key, _, _ in warnings],
+                session_key=session_key,
+            )
+            verdict = _smart_approve(command, combined_desc_for_llm)
+            _observe_smart_approval_verdict(observer_payload, verdict)
+            if verdict == "approve":
+                # Approve this command only. Pattern-level persistence would let one
+                # benign command suppress review of later commands that happen to
+                # match the same broad detector category.
+                _reset_denials(session_key)
+                logger.debug("Smart approval: auto-approved '%s' (%s)",
+                             command[:60], combined_desc_for_llm)
+                return {"approved": True, "message": None,
+                        "smart_approved": True,
+                        "description": combined_desc_for_llm}
+            elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
+                _record_denial(session_key)
+                breaker_addendum = _denial_breaker_addendum(session_key)
+                return {
+                    "approved": False,
+                    "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
+                               "The command was assessed as genuinely dangerous. "
+                               f"Do NOT retry.{breaker_addendum}",
+                    "smart_denied": True,
+                }
+            elif verdict == "deny":
+                # Guardian DENY that falls through to a one-operation human
+                # override still counts toward the consecutive-denial breaker;
+                # a subsequent human approval resets the tally below.
+                _record_denial(session_key)
+                smart_denied_for_owner = True
+            # An interactive owner may override DENY for this operation only.
+            # ESCALATE follows the normal, potentially persistent manual behavior.
 
     # --- Phase 3: Approval ---
 
