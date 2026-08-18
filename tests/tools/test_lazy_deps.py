@@ -408,10 +408,7 @@ class TestRefreshActiveFeatures:
         result = ld.restore_features(["platform.telegram"])
 
         assert result == {
-            "platform.telegram": (
-                "skipped: lazy installs disabled "
-                "(security.allow_lazy_installs=false)"
-            )
+            "platform.telegram": "skipped: lazy installs disabled by runtime gate"
         }
 
     def test_restore_snapshot_does_not_install_never_activated_features(
