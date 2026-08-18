@@ -295,6 +295,53 @@ def _get_extract_backend() -> str:
     return _get_capability_backend("extract")
 
 
+def _normalise_backend_name_list(raw: object) -> list[str]:
+    # Return a normalized list of backend names from YAML/list/env values.
+    # Provider names are sourced from the live registry rather than a closed
+    # allowlist so plugins may contribute arbitrary backends.
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = raw.replace(";", ",").split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(item) for item in raw]
+    else:
+        parts = [str(raw)]
+
+    valid = set(_LEGACY_WEB_BACKENDS)
+    valid.update(
+        getattr(provider, "name", "")
+        for provider in _list_registered_web_providers()
+        if isinstance(getattr(provider, "name", ""), str)
+    )
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = part.strip().lower()
+        if not name or name not in valid or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
+    return names
+
+
+def _get_search_fallback_backends(primary_backend: str = "") -> list[str]:
+    # Return configured fallback backends for web_search only.
+    # web.search_backend remains primary. web.search_fallback_backends is an
+    # ordered list, or comma-separated string, tried only when primary raises
+    # or returns success=false. web.search_fallback_backend is a single alias.
+    # HERMES_WEB_SEARCH_FALLBACK_BACKENDS is a process-env override.
+    cfg = _load_web_config()
+    raw = cfg.get("search_fallback_backends")
+    if raw is None:
+        raw = cfg.get("search_fallback_backend")
+    if raw is None:
+        raw = os.getenv("HERMES_WEB_SEARCH_FALLBACK_BACKENDS", "")
+
+    primary = (primary_backend or "").strip().lower()
+    return [name for name in _normalise_backend_name_list(raw) if name != primary]
+
+
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
@@ -697,7 +744,31 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             # uninstalled plugin, or capability mismatch).
             provider = get_active_search_provider()
 
-        if provider is None:
+        providers = []
+        seen_provider_names = set()
+
+        def _append_search_provider(candidate: object) -> None:
+            if candidate is None:
+                return
+            name = getattr(candidate, "name", "")
+            supports = getattr(candidate, "supports_search", None)
+            if not name or name in seen_provider_names or not callable(supports) or not supports():
+                return
+            providers.append(candidate)
+            seen_provider_names.add(name)
+
+        _append_search_provider(provider)
+        primary_name = getattr(provider, "name", backend or "")
+        for fallback_backend in _get_search_fallback_backends(primary_name):
+            if not _is_backend_available(fallback_backend):
+                logger.info(
+                    "Skipping unavailable web search fallback provider %s",
+                    fallback_backend,
+                )
+                continue
+            _append_search_provider(_wsp_get_provider(fallback_backend))
+
+        if not providers:
             # A bundled web plugin the user explicitly disabled looks
             # identical to "no provider" here — point at the real cause
             # (re-enable the plugin) rather than a generic setup hint.
@@ -722,11 +793,60 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     ),
                 }
         else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
-            )
-            response_data = provider.search(query, limit)
+            failures = []
+            last_provider_exception = None
+            response_data = None
+            for index, candidate in enumerate(providers):
+                role = "primary" if index == 0 else "fallback"
+                try:
+                    logger.info(
+                        "Web search via %s provider %s: '%s' (limit: %d)",
+                        role, candidate.name, query, limit,
+                    )
+                    candidate_response = candidate.search(query, limit)
+                except Exception as exc:  # noqa: BLE001 - fallback path needs provider errors
+                    last_provider_exception = exc
+                    failures.append(f"{candidate.name}: {exc}")
+                    logger.warning(
+                        "Web search provider %s failed; trying fallback if configured: %s",
+                        candidate.name, exc,
+                    )
+                    continue
+
+                if not isinstance(candidate_response, dict):
+                    failures.append(f"{candidate.name}: returned non-dict response")
+                    logger.warning(
+                        "Web search provider %s returned a non-dict response; trying fallback if configured",
+                        candidate.name,
+                    )
+                    continue
+
+                if candidate_response.get("success") is False:
+                    err = str(candidate_response.get("error") or "success=false")
+                    failures.append(f"{candidate.name}: {err}")
+                    logger.warning(
+                        "Web search provider %s returned success=false; trying fallback if configured: %s",
+                        candidate.name, err,
+                    )
+                    continue
+
+                response_data = candidate_response
+                if index > 0:
+                    metadata = response_data.setdefault("metadata", {})
+                    metadata.setdefault("backend", candidate.name)
+                    metadata.setdefault("fallback_from", providers[0].name)
+                    metadata.setdefault("fallback_failures", failures)
+                break
+
+            if response_data is None:
+                if len(providers) == 1 and last_provider_exception is not None:
+                    # Preserve the pre-fallback public error contract when no
+                    # fallback was configured and the sole provider raised.
+                    raise last_provider_exception
+                response_data = {
+                    "success": False,
+                    "error": "All configured web search providers failed: " + "; ".join(failures),
+                }
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
