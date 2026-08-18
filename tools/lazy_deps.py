@@ -364,6 +364,108 @@ class _InstallResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class LazyInstallPolicy:
+    config_allow_lazy_installs: bool | None
+    config_source: str
+    env_disable_lazy_installs: bool
+    env_disable_lazy_installs_value: str | None
+    lazy_install_target: str | None
+    effective_lazy_installs: bool
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "security.allow_lazy_installs": self.config_allow_lazy_installs,
+            "config_source": self.config_source,
+            "HERMES_DISABLE_LAZY_INSTALLS": self.env_disable_lazy_installs_value,
+            "env_disable_lazy_installs": self.env_disable_lazy_installs,
+            "HERMES_LAZY_INSTALL_TARGET": self.lazy_install_target,
+            "effective_lazy_installs": self.effective_lazy_installs,
+            "reason": self.reason,
+        }
+
+    def failure_reason(self) -> str:
+        env_value = self.env_disable_lazy_installs_value
+        env_display = env_value if env_value is not None else "(unset)"
+        return (
+            "lazy installs disabled "
+            f"({self.reason}; "
+            f"security.allow_lazy_installs={_policy_bool(self.config_allow_lazy_installs)}; "
+            f"HERMES_DISABLE_LAZY_INSTALLS={env_display}; "
+            f"HERMES_LAZY_INSTALL_TARGET={self.lazy_install_target or '(unset)'}; "
+            f"effective_lazy_installs={_policy_bool(self.effective_lazy_installs)})"
+        )
+
+
+def _policy_bool(value: bool | None) -> str:
+    if value is None:
+        return "unknown"
+    return "true" if value else "false"
+
+
+def _coerce_policy_bool(value: Any, *, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def get_lazy_install_policy() -> LazyInstallPolicy:
+    # Contract: config value + sealed-venv env policy + optional durable
+    # install target -> effective runtime value.
+    env_value = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS")
+    env_disabled = env_value == "1"
+    lazy_target = os.environ.get(_LAZY_TARGET_ENV)
+    has_lazy_target = bool((lazy_target or "").strip())
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        sec = cfg.get("security") if isinstance(cfg, dict) else {}
+        if not isinstance(sec, dict):
+            sec = {}
+        if "allow_lazy_installs" in sec:
+            config_allow = _coerce_policy_bool(sec.get("allow_lazy_installs"), default=True)
+            config_source = "security.allow_lazy_installs"
+        else:
+            config_allow = True
+            config_source = "default"
+    except Exception as exc:
+        config_allow = True
+        config_source = f"default (config unreadable: {exc})"
+
+    if config_allow is False:
+        effective = False
+        reason = "disabled by config"
+    elif env_disabled and not has_lazy_target:
+        effective = False
+        reason = "sealed venv without durable lazy install target"
+    elif env_disabled and has_lazy_target:
+        effective = True
+        reason = "enabled via durable lazy install target"
+    else:
+        effective = True
+        reason = "enabled by config" if config_source == "security.allow_lazy_installs" else "enabled by default"
+
+    return LazyInstallPolicy(
+        config_allow_lazy_installs=config_allow,
+        config_source=config_source,
+        env_disable_lazy_installs=env_disabled,
+        env_disable_lazy_installs_value=env_value,
+        lazy_install_target=lazy_target,
+        effective_lazy_installs=effective,
+        reason=reason,
+    )
+
+
 # =============================================================================
 # Internals
 # =============================================================================
@@ -499,41 +601,8 @@ def activate_durable_lazy_target() -> None:
 
 
 def _allow_lazy_installs() -> bool:
-    """Return whether lazy installs are permitted in this environment.
-
-    Resolution order:
-
-    1. ``security.allow_lazy_installs: false`` in config.yaml is an absolute
-       opt-out — it disables installs in BOTH venv-scoped and durable-target
-       modes. This is the user-facing kill switch.
-    2. ``HERMES_DISABLE_LAZY_INSTALLS=1`` seals the *agent venv* (set by the
-       immutable Docker image). It blocks venv-scoped installs — UNLESS a
-       durable install target is configured, in which case installs are
-       redirected there (a path that structurally cannot break the sealed
-       venv) and are therefore allowed.
-
-    Defaults to True. If config is unreadable we fail open (allow), because
-    refusing to install would lock people out of their own backends; the
-    decision to block is an explicit user opt-in.
-    """
-    # (1) Config kill switch wins in every mode.
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-    except Exception:
-        cfg = None
-    if cfg is not None:
-        sec = cfg.get("security") or {}
-        if not bool(sec.get("allow_lazy_installs", True)):
-            return False
-
-    # (2) Sealed-venv env var: blocks ONLY when there is no safe durable
-    # target to redirect into. With a target set, the install goes to the
-    # data volume (append-only on sys.path), so the seal is preserved.
-    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1":
-        return _lazy_install_target() is not None
-
-    return True
+    """Return whether lazy installs are permitted in this environment."""
+    return get_lazy_install_policy().effective_lazy_installs
 
 
 def _unsupported_feature_reason(feature: str) -> Optional[str]:
@@ -905,11 +974,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 f"refusing to install unsafe spec {spec!r}"
             )
 
+    lazy_policy = get_lazy_install_policy()
     if not _allow_lazy_installs():
-        raise FeatureUnavailable(
-            feature, missing,
-            "lazy installs disabled (security.allow_lazy_installs=false)"
+        reason = (
+            lazy_policy.failure_reason()
+            if not lazy_policy.effective_lazy_installs
+            else "lazy installs disabled by runtime gate"
         )
+        raise FeatureUnavailable(feature, missing, reason)
 
     # Only show the interactive confirmation when we own a TTY and
     # prompt_toolkit isn't running.  A bare input() deadlocks when a

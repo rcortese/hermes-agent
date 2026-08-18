@@ -105,6 +105,39 @@ class TestAllowlist:
 
 
 class TestSecurityGating:
+    def test_policy_reports_config_disable(self, monkeypatch):
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"security": {"allow_lazy_installs": False}},
+        )
+
+        policy = ld.get_lazy_install_policy()
+
+        assert policy.effective_lazy_installs is False
+        assert policy.reason == "disabled by config"
+
+    def test_policy_reports_sealed_venv_without_target(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+        policy = ld.get_lazy_install_policy()
+
+        assert policy.effective_lazy_installs is False
+        assert policy.reason == "sealed venv without durable lazy install target"
+
+    def test_policy_reports_effective_durable_target(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path / "lazy"))
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+        policy = ld.get_lazy_install_policy()
+
+        assert policy.effective_lazy_installs is True
+        assert policy.reason == "enabled via durable lazy install target"
+
     def test_disabled_via_config_raises(self, monkeypatch):
         # Pretend honcho is missing AND lazy installs are disabled.
         monkeypatch.setitem(ld.LAZY_DEPS, "test.feat", ("packageX>=1.0,<2",))
