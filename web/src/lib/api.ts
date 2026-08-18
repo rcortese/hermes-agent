@@ -2171,19 +2171,22 @@ export interface ProfileDescribeAutoResult {
 
 export interface ProfileInfo {
   name: string;
-  path: string;
+  path: string | null;
   is_default: boolean;
   model: string | null;
   provider: string | null;
   has_env: boolean;
   skill_count: number;
   gateway_running: boolean;
-  description: string;
-  description_auto: boolean;
-  distribution_name: string | null;
-  distribution_version: string | null;
-  distribution_source: string | null;
-  has_alias: boolean;
+  description?: string;
+  description_auto?: boolean;
+  distribution_name?: string | null;
+  distribution_version?: string | null;
+  distribution_source?: string | null;
+  has_alias?: boolean;
+  label?: string;
+  remote_proxy?: boolean;
+  profile_kind?: string;
 }
 
 export interface ModelsAnalyticsModelEntry {

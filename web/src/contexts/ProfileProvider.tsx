@@ -6,8 +6,29 @@ import {
   type ReactNode,
 } from "react";
 import { useLocation, useSearchParams } from "react-router";
-import { api, setManagementProfile } from "@/lib/api";
-import { ProfileContext } from "@/contexts/profile-context";
+import { api, setManagementProfile, type ProfileInfo } from "@/lib/api";
+import { ProfileContext, type ProfileOption } from "@/contexts/profile-context";
+
+function isRemoteProfile(profile: ProfileInfo) {
+  return Boolean(
+    profile.remote_proxy || profile.profile_kind === "remote_gateway_proxy",
+  );
+}
+
+export function sortProfilesForSelector(profiles: ProfileInfo[]): ProfileOption[] {
+  return [...profiles]
+    .sort((a, b) => {
+      const remoteDelta = Number(isRemoteProfile(b)) - Number(isRemoteProfile(a));
+      if (remoteDelta !== 0) return remoteDelta;
+      return a.name.localeCompare(b.name);
+    })
+    .map(({ name, label, remote_proxy, profile_kind }) => ({
+      name,
+      label,
+      remote_proxy,
+      profile_kind,
+    }));
+}
 
 /**
  * Machine-level management-profile scope.
@@ -36,7 +57,7 @@ import { ProfileContext } from "@/contexts/profile-context";
 export function ProfileProvider({ children }: { children: ReactNode }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const { pathname } = useLocation();
-  const [profiles, setProfiles] = useState<string[]>([]);
+  const [profiles, setProfiles] = useState<ProfileOption[]>([]);
   const [currentProfile, setCurrentProfile] = useState("default");
 
   // Initial value comes from the URL (deep link / refresh / unified-launch
@@ -86,7 +107,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
       .then(([profilesRes, info]) => {
         if (cancelled) return;
 
-        setProfiles(profilesRes.profiles.map((p) => p.name));
+        setProfiles(sortProfilesForSelector(profilesRes.profiles));
 
         const current = info.current || "default";
         const active = info.active || "default";
