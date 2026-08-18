@@ -61,6 +61,37 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+_HUMAN_MEMORY_SURFACES = frozenset({"telegram", "webui"})
+_MEMORY_BLOCKING_ENV_FLAGS = (
+    "HERMES_SAFE_MODE",
+    "HERMES_IGNORE_RULES",
+    "HERMES_IGNORE_USER_CONFIG",
+)
+
+
+def _memory_identity(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _should_skip_memory_for_runtime(
+    *,
+    platform: object = None,
+    explicit_skip_memory: bool = False,
+) -> bool:
+    """Return True unless this is an allowlisted direct human surface.
+
+    Persistent memory providers are deployment-private state. Only direct
+    Telegram and WebUI AIAgent instances may initialize them; routing
+    environment variables alone are not authorization.
+    """
+    if explicit_skip_memory:
+        return True
+    for name in _MEMORY_BLOCKING_ENV_FLAGS:
+        if is_truthy_value(os.environ.get(name)):
+            return True
+    return _memory_identity(platform) not in _HUMAN_MEMORY_SURFACES
+
+
 # Memory providers we've already warned are unavailable. Deduped because the
 # gateway builds a fresh AIAgent per message, so an un-deduped warning would
 # fire on every turn.
@@ -618,6 +649,10 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+    skip_memory = _should_skip_memory_for_runtime(
+        platform=platform,
+        explicit_skip_memory=bool(skip_memory),
+    )
 
     agent.model = model
     agent.max_iterations = max_iterations
