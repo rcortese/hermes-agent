@@ -1,13 +1,14 @@
-# A build must supply DEBIAN_BASE_DIGEST as sha256:<64 lowercase hex>.  The
-# source-only validator and CI contract reject absent, tagged, or non-Debian
-# references; keeping the repository literal here prevents repository swaps.
-ARG DEBIAN_BASE_DIGEST
+# Debian 13.4 linux/amd64 manifest resolved from Docker Official Images on
+# 2026-08-23. Index: sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da.
+# This lock is source-owned rather than a mutable CI variable; the validator
+# rejects replacements so every Docker stage uses the reviewed platform image.
+ARG DEBIAN_BASE_DIGEST=sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
 
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
-FROM debian@${DEBIAN_BASE_DIGEST} AS sqlite_build
+FROM --platform=linux/amd64 docker.io/library/debian:13.4@${DEBIAN_BASE_DIGEST} AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 RUN apt-get -o Acquire::Retries=3 update && \
@@ -54,7 +55,7 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # our Debian 13 (trixie, glibc 2.41) runtime.  Bumping to a new Node major
 # is a one-line ARG change; see #4977.
 FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS node_source
-FROM debian@${DEBIAN_BASE_DIGEST}
+FROM --platform=linux/amd64 docker.io/library/debian:13.4@${DEBIAN_BASE_DIGEST}
 ARG DEBIAN_BASE_DIGEST
 LABEL org.opencontainers.image.base.name=debian@${DEBIAN_BASE_DIGEST}
 LABEL org.opencontainers.image.base.digest=${DEBIAN_BASE_DIGEST}

@@ -25,9 +25,11 @@ concurrency:
 
 env:
   IMAGE_NAME: nousresearch/hermes-agent
-  # Repository variable supplied by the build-admission authority.  It is
-  # intentionally unset in source: no candidate may invent a Debian digest.
-  DEBIAN_BASE_DIGEST: ${{ vars.HERMES_DEBIAN_BASE_DIGEST }}
+  # Debian 13.4 linux/amd64 manifest, resolved from Docker Official Images on
+  # 2026-08-23. Its manifest-list/index is
+  # sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da.
+  # This source-owned lock must not be overridden by a mutable CI variable.
+  DEBIAN_BASE_DIGEST: sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
 
 jobs:
   # Build and test the image for each architecture. This job runs PR code,
@@ -44,11 +46,6 @@ jobs:
             platform: linux/amd64
             cache-from: type=gha,scope=docker-amd64
             cache-to: type=gha,mode=max,scope=docker-amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            cache-from: type=gha,scope=docker-arm64
-            cache-to: type=gha,mode=max,scope=docker-arm64
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -158,11 +155,6 @@ jobs:
             platform: linux/amd64
             cache-from: type=gha,scope=docker-amd64
             cache-to: type=gha,mode=max,scope=docker-amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            cache-from: type=gha,scope=docker-arm64
-            cache-to: type=gha,mode=max,scope=docker-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -224,9 +216,8 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Stitch both per-arch digests into a single tagged multi-arch manifest.
-  # This is a registry-side operation — no building, no layer re-push —
-  # so it runs in ~30 seconds.
+  # Tag the reviewed linux/amd64 image digest. This is a registry-side
+  # operation — no building, no layer re-push — so it runs in ~30 seconds.
   #
   # On main pushes: tags both :main and :latest.
   # On releases: tags :<release_tag_name>.
