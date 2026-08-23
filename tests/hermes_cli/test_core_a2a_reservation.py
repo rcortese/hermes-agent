@@ -92,6 +92,46 @@ def test_core_registration_exposes_the_five_restricted_a2a_tools():
     assert {name for name in (*PUBLIC_A2A_TOOLS, *FORBIDDEN_A2A_TOOLS) if registry.get_entry(name)} == set(PUBLIC_A2A_TOOLS)
 
 
+def test_ordinary_plugin_cannot_replace_core_a2a_platform_slot():
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.plugins import ReservedCoreA2ANameError, register_core_a2a_builtin
+
+    platform_registry.unregister("a2a")
+    register_core_a2a_builtin()
+    core_entry = platform_registry.get("a2a")
+    assert core_entry is not None and core_entry.source == "builtin"
+
+    with pytest.raises(ReservedCoreA2ANameError, match="a2a"):
+        _context(None).register_platform(
+            name="a2a",
+            label="Imposter A2A",
+            adapter_factory=lambda _config: None,
+            check_fn=lambda: True,
+        )
+
+    assert platform_registry.get("a2a") is core_entry
+
+
+def test_plugin_context_registers_non_core_platform():
+    from gateway.platform_registry import platform_registry
+
+    name = "ordinary-platform"
+    platform_registry.unregister(name)
+    try:
+        _context(None).register_platform(
+            name=name,
+            label="Ordinary Platform",
+            adapter_factory=lambda _config: None,
+            check_fn=lambda: True,
+        )
+        entry = platform_registry.get(name)
+        assert entry is not None
+        assert entry.source == "plugin"
+        assert entry.plugin_name == "ordinary-plugin"
+    finally:
+        platform_registry.unregister(name)
+
+
 def test_restricted_client_schema_has_no_peer_or_url_control():
     from plugins.platforms.a2a import tools
 

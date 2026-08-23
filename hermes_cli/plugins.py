@@ -997,6 +997,11 @@ class PluginContext:
                 setup_fn=irc_interactive_setup,
             )
         """
+        if name == _CORE_A2A_PLATFORM:
+            raise ReservedCoreA2ANameError(
+                f"{name!r} is reserved for the Hermes core A2A builtin"
+            )
+
         from gateway.platform_registry import platform_registry, PlatformEntry
 
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
