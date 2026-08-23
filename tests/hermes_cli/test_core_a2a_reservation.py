@@ -205,6 +205,7 @@ def test_restricted_client_rejects_caller_selected_endpoint():
 def test_restricted_client_posts_only_to_fixed_endpoint_with_configured_bearer(monkeypatch):
     from plugins.platforms.a2a import tools
 
+    configured_bearer = "***"
     seen = {}
 
     class Response:
@@ -224,13 +225,13 @@ def test_restricted_client_posts_only_to_fixed_endpoint_with_configured_bearer(m
     monkeypatch.setattr(
         tools,
         "_load_config",
-        lambda: {"a2a_agents": {"denholm": {"auth": {"type": "bearer", "token": "config-ref"}}}},
+        lambda: {"a2a_agents": {"denholm": {"auth": {"type": "bearer", "token": configured_bearer}}}},
     )
     monkeypatch.setattr(tools._NO_REDIRECT_OPENER, "open", open_fixed)
 
     assert "ack" in tools.a2a_call({"message": "hi"})
     assert seen["url"] == "http://denholm:9900"
-    assert seen["auth"] == "Bearer config-ref"
+    assert seen["auth"] == f"Bearer {configured_bearer}"
 
 
 def test_redirect_handler_rejects_redirects_instead_of_retargeting_call():
