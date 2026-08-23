@@ -3,11 +3,16 @@
 ## Authority boundary
 
 The package name is `a2a-platform`, its Hermes plugin kind is `platform`, and its
-normative outbound registration set is exactly `[a2a_call]`. The tool accepts
-only a message (and optional continued-exchange context id) and always calls
-the `denholm` alias at `http://denholm:9900`; configuration supplies only its
-bearer credential reference and timeout. The core-owned A2A API cannot be
-replaced or expanded by a plugin.
+normative outbound registration set is exactly `[a2a_call, a2a_discover,
+a2a_list, a2a_history, a2a_orchestrate]`. `a2a_call` and `a2a_orchestrate`
+accept one message (and optional continued-exchange context id) and always call
+the `denholm` alias at `http://denholm:9900`; `a2a_orchestrate` is deliberately
+a single delegation, never fan-out. `a2a_discover` and `a2a_list` only describe
+that fixed authority without remote Agent Card lookup or peer enumeration, and
+`a2a_history` reads bounded local persisted context records. Configuration
+supplies only the bearer credential reference and timeout. No model tool accepts
+a URL, peer, path, or credential, and redirects cannot extend endpoint authority.
+The core-owned A2A API cannot be replaced or expanded by a plugin.
 
 ## Separate inbound surface
 

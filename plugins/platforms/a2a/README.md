@@ -2,15 +2,21 @@
 
 `a2a-platform` is a Hermes `platform` plugin with two separately declared surfaces:
 
-- **Outbound tool surface:** only `a2a_call(message[, context_id])` in toolset `a2a`.
-  It always calls the `denholm` alias at `http://denholm:9900`; callers cannot
-  choose an agent or URL.
+- **Outbound tool surface:** five core-owned tools in toolset `a2a`:
+  `a2a_call(message[, context_id])`, `a2a_discover()`, `a2a_list()`,
+  `a2a_history(context_id[, limit])`, and `a2a_orchestrate(message[, context_id])`.
+  Calls and orchestration always use the single `denholm` alias at
+  `http://denholm:9900`; orchestration is one delegation, not fan-out.
+  Discovery/list are fixed local descriptions rather than remote discovery or
+  enumeration, and history reads only local persisted context records.
+  Callers cannot choose an agent, URL, path, or credential.
 - **Inbound adapter:** platform `a2a`, retaining authenticated A2A task reception
   through the Hermes gateway adapter.
 
-The plugin does **not** register discovery, list, history, orchestration, or fan-out tools.
-Conversation persistence and protocol support used internally by the admitted call
-and inbound adapter are not additional model-visible tools.
+The plugin does **not** perform remote discovery, remote peer listing, remote
+history reads, direct-URL routing, or fan-out. Conversation persistence and
+protocol support used internally by the admitted calls and inbound adapter are
+not an authority to contact another peer.
 
 ## Configuration
 
@@ -25,7 +31,10 @@ a2a_agents:
 ```
 
 The outbound tool posts only to its fixed endpoint. It does not use Agent Card
-discovery, and redirects cannot replace or extend endpoint authority.
+discovery, accept caller routing/credentials, or let redirects replace or extend
+endpoint authority. The inbound listener remains on port `9900` and Docker
+runtime configuration must keep that listener Docker-internal (no host port
+publication).
 
 A name in `plugins.disabled` wins over `plugins.enabled`; this restricted profile
 therefore keeps the plugin enabled and not disabled. Inbound listener lifecycle

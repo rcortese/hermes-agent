@@ -1,9 +1,12 @@
 """Restricted Moss-to-Denholm A2A client tool.
 
-The model-visible A2A contract is intentionally one-way and single-purpose:
-``a2a_call(message)`` sends a task only to the fixed ``denholm`` peer at
-``http://denholm:9900``.  The endpoint is not configurable by a caller, Agent
-Card discovery is not performed, and HTTP redirects are rejected.
+The model-visible A2A contract exposes five familiar operations, all restricted
+to one fixed peer: ``a2a_call`` and ``a2a_orchestrate`` send one task only to
+``denholm`` at ``http://denholm:9900``; ``a2a_discover`` and ``a2a_list`` only
+describe that local fixed authority; and ``a2a_history`` reads local persisted
+conversation records. The endpoint is not configurable by a caller, remote
+Agent Card discovery is not performed, fan-out is unavailable, and HTTP
+redirects are rejected.
 
 The bearer credential is read from the configured ``a2a_agents.denholm.auth``
 entry; it is never accepted as a tool argument or emitted in a schema.
@@ -103,7 +106,7 @@ def _short_state(state: str) -> str:
 
 def a2a_call(args: dict, **_: Any) -> str:
     """Send ``message`` to the fixed Denholm peer and return its reply."""
-    if any(key in args for key in ("agent", "agent_name", "name", "url", "endpoint")):
+    if any(key in args for key in ("agent", "agent_name", "name", "url", "endpoint", "path", "credential", "token")):
         return "Error: caller-selected endpoint or peer is not permitted; a2a_call always targets Denholm."
     message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
@@ -163,6 +166,54 @@ def a2a_call(args: dict, **_: Any) -> str:
     return f"{header}\n{body}"
 
 
+def _fixed_peer_description() -> dict[str, str]:
+    """Return the sole peer descriptor without contacting a remote endpoint."""
+    return {
+        "peer": _DENHOLM_ALIAS,
+        "endpoint": _DENHOLM_ENDPOINT,
+        "discovery": "disabled",
+    }
+
+
+def a2a_discover(args: dict, **_: Any) -> str:
+    """Describe the fixed Denholm authority; never perform remote discovery."""
+    if args:
+        return "Error: a2a_discover has no caller-selected routing options."
+    return json.dumps(_fixed_peer_description())
+
+
+def a2a_list(args: dict, **_: Any) -> str:
+    """List the one approved peer without querying or routing to remote agents."""
+    if args:
+        return "Error: a2a_list has no caller-selected routing options."
+    return json.dumps({"peers": [_fixed_peer_description()]})
+
+
+def a2a_history(args: dict, **_: Any) -> str:
+    """Read bounded local conversation history for an explicit context id."""
+    if any(key in args for key in ("agent", "agent_name", "name", "url", "endpoint", "path", "credential", "token")):
+        return "Error: caller-selected endpoint, peer, or path is not permitted."
+    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
+    if not context_id:
+        return "Error: 'context_id' is required."
+    try:
+        limit = min(50, max(1, int(args.get("limit", 50))))
+    except (TypeError, ValueError):
+        return "Error: 'limit' must be an integer."
+    return json.dumps({
+        "peer": _DENHOLM_ALIAS,
+        "context_id": context_id,
+        "messages": protocol.load_conversation(context_id, limit=limit),
+    })
+
+
+def a2a_orchestrate(args: dict, **kwargs: Any) -> str:
+    """Delegate one task to Denholm; this is not multi-peer orchestration."""
+    if any(key in args for key in ("agent", "agent_name", "name", "agents", "peers", "targets", "fanout", "url", "endpoint", "path", "credential", "token")):
+        return "Error: fan-out, caller-selected routing, and caller credentials are not permitted."
+    return a2a_call(args, **kwargs)
+
+
 _FunctionSchema = TypedDict(
     "_FunctionSchema",
     {"name": str, "description": str, "parameters": dict[str, Any]},
@@ -175,18 +226,60 @@ _SCHEMAS: dict[str, _ToolSchema] = {
         "type": "function",
         "function": {
             "name": "a2a_call",
-            "description": "Send a task to the fixed Denholm A2A peer and return its reply.",
+            "description": "Send one task to the fixed Denholm A2A peer and return its reply.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The task or message to send to Denholm.",
-                    },
-                    "context_id": {
-                        "type": "string",
-                        "description": "Optional prior context id for a continued Denholm exchange.",
-                    },
+                    "message": {"type": "string", "description": "The task or message to send to Denholm."},
+                    "context_id": {"type": "string", "description": "Optional prior context id for a continued Denholm exchange."},
+                },
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "a2a_discover": {
+        "type": "function",
+        "function": {
+            "name": "a2a_discover",
+            "description": "Describe the fixed Denholm authority; no remote Agent Card lookup is performed.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    "a2a_list": {
+        "type": "function",
+        "function": {
+            "name": "a2a_list",
+            "description": "List the one approved Denholm peer; no remote peer enumeration is performed.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    "a2a_history": {
+        "type": "function",
+        "function": {
+            "name": "a2a_history",
+            "description": "Read bounded local persisted history for a Denholm context; no remote history request is made.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "context_id": {"type": "string", "description": "The locally persisted Denholm context id."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum local messages to return (default 50)."},
+                },
+                "required": ["context_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "a2a_orchestrate": {
+        "type": "function",
+        "function": {
+            "name": "a2a_orchestrate",
+            "description": "Delegate one task to fixed Denholm only; this never fans out or selects peers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "The single task to delegate to Denholm."},
+                    "context_id": {"type": "string", "description": "Optional prior context id for the one Denholm exchange."},
                 },
                 "required": ["message"],
                 "additionalProperties": False,
@@ -195,18 +288,25 @@ _SCHEMAS: dict[str, _ToolSchema] = {
     },
 }
 
-_HANDLERS = {"a2a_call": a2a_call}
+_HANDLERS = {
+    "a2a_call": a2a_call,
+    "a2a_discover": a2a_discover,
+    "a2a_list": a2a_list,
+    "a2a_history": a2a_history,
+    "a2a_orchestrate": a2a_orchestrate,
+}
 
 
 def register_tools(ctx) -> None:
-    """Register the sole model-visible restricted A2A client tool."""
-    schema = _SCHEMAS["a2a_call"].get("function")
-    assert schema is not None
-    ctx.register_tool(
-        name="a2a_call",
-        toolset="a2a",
-        schema=schema,
-        handler=a2a_call,
-        description=schema["description"],
-        emoji="\U0001f9e9",
-    )
+    """Register the five core-owned, fixed-Denholm A2A model tools."""
+    for name, handler in _HANDLERS.items():
+        schema = _SCHEMAS[name].get("function")
+        assert schema is not None
+        ctx.register_tool(
+            name=name,
+            toolset="a2a",
+            schema=schema,
+            handler=handler,
+            description=schema["description"],
+            emoji="\U0001f9e9",
+        )

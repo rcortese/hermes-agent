@@ -4,9 +4,9 @@ A2A (Agent-to-Agent) plugin for Hermes Agent.
 Registers:
   - The ``a2a`` platform adapter (inbound: exposes Hermes as an A2A agent,
     protocol v1.0).
-  - The single restricted ``a2a_call`` client tool (outbound: call Denholm).
+  - The five restricted client tools (outbound: fixed Denholm operations only).
 
-The package supplies implementations; core registers the sole public A2A API
+The package supplies implementations; core registers the five public A2A APIs
 and the platform slot directly so plugin contexts cannot claim them.
 """
 
