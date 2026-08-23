@@ -83,10 +83,6 @@ class ReservedCoreA2ANameError(PermissionError):
 _CORE_A2A_PLATFORM = "a2a"
 _CORE_A2A_TOOLS = (
     "a2a_call",
-    "a2a_discover",
-    "a2a_list",
-    "a2a_history",
-    "a2a_orchestrate",
 )
 
 
@@ -1283,7 +1279,7 @@ class PluginContext:
 # ---------------------------------------------------------------------------
 
 def register_core_a2a_builtin() -> None:
-    """Register the five Hermes-owned A2A APIs without a PluginContext.
+    """Register the restricted Hermes-owned A2A API without a PluginContext.
 
     The shipped package supplies the implementation, while this core path owns
     its platform and tool slots.  This is a collision policy, not a claim that

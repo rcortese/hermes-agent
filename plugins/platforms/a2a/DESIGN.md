@@ -3,9 +3,11 @@
 ## Authority boundary
 
 The package name is `a2a-platform`, its Hermes plugin kind is `platform`, and its
-normative outbound registration set is exactly `[a2a_call, a2a_discover, a2a_list, a2a_history, a2a_orchestrate]`. The tool accepts an
-approved configured alias plus a message; configuration owns the URL, bearer
-credential, timeout, and exact outbound allowlist. The five documented client APIs remain core-owned; no plugin can replace or add to that set.
+normative outbound registration set is exactly `[a2a_call]`. The tool accepts
+only a message (and optional continued-exchange context id) and always calls
+the `denholm` alias at `http://denholm:9900`; configuration supplies only its
+bearer credential reference and timeout. The core-owned A2A API cannot be
+replaced or expanded by a plugin.
 
 ## Separate inbound surface
 

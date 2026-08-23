@@ -524,7 +524,7 @@ class RateLimiter:
 # --------------------------------------------------------------------------
 
 # Module-level singleton shared by the inbound adapter and the outbound client
-# tools so /metrics and a2a_list report both directions. Not persisted.
+# tooling can report both directions. Not persisted.
 class Metrics:
     """Simple counters for A2A operations."""
 
