@@ -1,8 +1,13 @@
+# A build must supply DEBIAN_BASE_DIGEST as sha256:<64 lowercase hex>.  The
+# source-only validator and CI contract reject absent, tagged, or non-Debian
+# references; keeping the repository literal here prevents repository swaps.
+ARG DEBIAN_BASE_DIGEST
+
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
-FROM debian:13.4 AS sqlite_build
+FROM debian@${DEBIAN_BASE_DIGEST} AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 RUN apt-get -o Acquire::Retries=3 update && \
@@ -49,7 +54,10 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # our Debian 13 (trixie, glibc 2.41) runtime.  Bumping to a new Node major
 # is a one-line ARG change; see #4977.
 FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS node_source
-FROM debian:13.4
+FROM debian@${DEBIAN_BASE_DIGEST}
+ARG DEBIAN_BASE_DIGEST
+LABEL org.opencontainers.image.base.name=debian@${DEBIAN_BASE_DIGEST}
+LABEL org.opencontainers.image.base.digest=${DEBIAN_BASE_DIGEST}
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the

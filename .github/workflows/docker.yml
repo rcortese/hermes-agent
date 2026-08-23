@@ -25,6 +25,9 @@ concurrency:
 
 env:
   IMAGE_NAME: nousresearch/hermes-agent
+  # Repository variable supplied by the build-admission authority.  It is
+  # intentionally unset in source: no candidate may invent a Debian digest.
+  DEBIAN_BASE_DIGEST: ${{ vars.HERMES_DEBIAN_BASE_DIGEST }}
 
 jobs:
   # Build and test the image for each architecture. This job runs PR code,
@@ -53,6 +56,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Validate immutable Debian base
+        run: python3 scripts/validate_debian_base.py "${DEBIAN_BASE_DIGEST}"
+
       # Retry once on transient Docker Hub / buildkit pull failures
       # (connection reset, auth token timeout, rate limiting). The action
       # generates a unique builder name per invocation so the retry doesn't
@@ -78,8 +84,13 @@ jobs:
           load: true
           platforms: ${{ matrix.platform }}
           tags: ${{ env.IMAGE_NAME }}:test
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.base.name=debian@${{ env.DEBIAN_BASE_DIGEST }}
+            org.opencontainers.image.base.digest=${{ env.DEBIAN_BASE_DIGEST }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
+            DEBIAN_BASE_DIGEST=${{ env.DEBIAN_BASE_DIGEST }}
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ (github.event_name != 'pull_request') && matrix.cache-to || '' }}
 
@@ -158,6 +169,9 @@ jobs:
       - name: Checkout trusted source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Validate immutable Debian base
+        run: python3 scripts/validate_debian_base.py "${DEBIAN_BASE_DIGEST}"
+
       # Retry once on transient Docker Hub / buildkit pull failures.
       # See build job for rationale; same pattern.
       - name: Set up Docker Buildx
@@ -186,8 +200,11 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.base.name=debian@${{ env.DEBIAN_BASE_DIGEST }}
+            org.opencontainers.image.base.digest=${{ env.DEBIAN_BASE_DIGEST }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
+            DEBIAN_BASE_DIGEST=${{ env.DEBIAN_BASE_DIGEST }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}

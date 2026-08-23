@@ -76,6 +76,20 @@ class PluginToolOverrideError(PermissionError):
     """
 
 
+class ReservedCoreA2ANameError(PermissionError):
+    """Raised when a plugin attempts to claim a core-owned A2A slot."""
+
+
+_CORE_A2A_PLATFORM = "a2a"
+_CORE_A2A_TOOLS = (
+    "a2a_call",
+    "a2a_discover",
+    "a2a_list",
+    "a2a_history",
+    "a2a_orchestrate",
+)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -435,6 +449,10 @@ class PluginContext:
         like ``shell_exec`` or ``write_file`` and exfiltrate everything
         the model invokes through it.
         """
+        if name in _CORE_A2A_TOOLS:
+            raise ReservedCoreA2ANameError(
+                f"{name!r} is reserved for the Hermes core A2A builtin"
+            )
         if override and not self._tool_override_allowed(name):
             plugin_id = self.manifest.key or self.manifest.name
             raise PluginToolOverrideError(
@@ -1264,6 +1282,81 @@ class PluginContext:
 # PluginManager
 # ---------------------------------------------------------------------------
 
+def register_core_a2a_builtin() -> None:
+    """Register the five Hermes-owned A2A APIs without a PluginContext.
+
+    The shipped package supplies the implementation, while this core path owns
+    its platform and tool slots.  This is a collision policy, not a claim that
+    arbitrary same-interpreter mutation is an absolute security boundary.
+    """
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from plugins.platforms.a2a import (
+        check_requirements,
+        interactive_setup,
+        is_connected,
+        validate_config,
+    )
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    from plugins.platforms.a2a.tools import _HANDLERS, _SCHEMAS
+    from tools.registry import registry
+
+    platform_registry.register(
+        PlatformEntry(
+            name=_CORE_A2A_PLATFORM,
+            label="A2A",
+            adapter_factory=lambda cfg: A2AAdapter(cfg),
+            check_fn=check_requirements,
+            validate_config=validate_config,
+            is_connected=is_connected,
+            required_env=[],
+            install_hint="No extra packages needed (stdlib only)",
+            setup_fn=interactive_setup,
+            source="builtin",
+            emoji="🧩",
+            allowed_users_env="A2A_ALLOWED_USERS",
+            allow_all_env="A2A_ALLOW_ALL_USERS",
+            cron_deliver_env_var="A2A_HOME_CHANNEL",
+            allow_update_command=False,
+        )
+    )
+    for name in _CORE_A2A_TOOLS:
+        schema = _SCHEMAS[name]["function"]
+        registry.register(
+            name=name,
+            toolset="a2a",
+            schema=schema,
+            handler=_HANDLERS[name],
+            description=schema["description"],
+            emoji="🧩",
+        )
+
+
+def _is_core_a2a_manifest(manifest: PluginManifest) -> bool:
+    return manifest.source == "bundled" and manifest.name == "a2a-platform"
+
+
+def _reject_reserved_a2a_collisions(manifests: List[PluginManifest]) -> None:
+    """Reject alternate plugin claims before their code is imported."""
+    for manifest in manifests:
+        if _is_core_a2a_manifest(manifest):
+            continue
+        platform_name = (
+            manifest.name[: -len("-platform")]
+            if manifest.name.endswith("-platform")
+            else Path(manifest.path).name if manifest.path else manifest.name
+        )
+        if manifest.kind == "platform" and platform_name == _CORE_A2A_PLATFORM:
+            raise ReservedCoreA2ANameError(
+                f"Plugin {manifest.key or manifest.name!r} collides with core platform 'a2a'"
+            )
+        collisions = set(manifest.provides_tools).intersection(_CORE_A2A_TOOLS)
+        if collisions:
+            name = sorted(collisions)[0]
+            raise ReservedCoreA2ANameError(
+                f"Plugin {manifest.key or manifest.name!r} collides with core tool {name!r}"
+            )
+
+
 class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
@@ -1388,6 +1481,8 @@ class PluginManager:
         ep_manifests = self._scan_entry_points()
         logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
         manifests.extend(ep_manifests)
+        _reject_reserved_a2a_collisions(manifests)
+        register_core_a2a_builtin()
 
         # Load each manifest (skip user-disabled plugins).
         # Later sources override earlier ones on key collision — user
@@ -1402,6 +1497,8 @@ class PluginManager:
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
         for manifest in winners.values():
+            if _is_core_a2a_manifest(manifest):
+                continue
             lookup_key = manifest.key or manifest.name
 
             # Explicit disable always wins (matches on key or on legacy
@@ -2447,12 +2544,13 @@ def get_plugin_toolsets() -> List[tuple]:
     alongside the built-in ones and can be toggled on/off per platform.
     """
     manager = get_plugin_manager()
-    if not manager._plugin_tool_names:
-        return []
-
     try:
         from tools.registry import registry
     except Exception:
+        return []
+
+    core_a2a = [registry.get_entry(name) for name in _CORE_A2A_TOOLS]
+    if not manager._plugin_tool_names and not any(core_a2a):
         return []
 
     # Group plugin tool names by their toolset
@@ -2464,6 +2562,10 @@ def get_plugin_toolsets() -> List[tuple]:
             continue
         ts = entry.toolset
         toolset_tools.setdefault(ts, []).append(entry.name)
+
+    for entry in core_a2a:
+        if entry is not None:
+            toolset_tools.setdefault(entry.toolset, []).append(entry.name)
 
     # Map toolsets back to the plugin that registered them
     for _name, loaded in manager._plugins.items():
