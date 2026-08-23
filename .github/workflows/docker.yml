@@ -25,11 +25,12 @@ concurrency:
 
 env:
   IMAGE_NAME: nousresearch/hermes-agent
-  # Debian 13.4 linux/amd64 manifest, resolved from Docker Official Images on
-  # 2026-08-23. Its manifest-list/index is
+  # Debian 13.4 linux/{amd64,arm64} manifests, resolved from Docker Official
+  # Images on 2026-08-23. Their manifest-list/index is
   # sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da.
-  # This source-owned lock must not be overridden by a mutable CI variable.
-  DEBIAN_BASE_DIGEST: sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
+  # These source-owned locks must not be overridden by mutable CI variables.
+  DEBIAN_BASE_AMD64_DIGEST: sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
+  DEBIAN_BASE_ARM64_DIGEST: sha256:7e0ade45154451d0730a9818e9c4c8721ea4022e7c4dc1e42d44e99c5f4f1d04
 
 jobs:
   # Build and test the image for each architecture. This job runs PR code,
@@ -44,8 +45,15 @@ jobs:
           - arch: amd64
             runner: ubuntu-latest
             platform: linux/amd64
+            debian-base-digest: sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
             cache-from: type=gha,scope=docker-amd64
             cache-to: type=gha,mode=max,scope=docker-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            debian-base-digest: sha256:7e0ade45154451d0730a9818e9c4c8721ea4022e7c4dc1e42d44e99c5f4f1d04
+            cache-from: type=gha,scope=docker-arm64
+            cache-to: type=gha,mode=max,scope=docker-arm64
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -54,7 +62,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Validate immutable Debian base
-        run: python3 scripts/validate_debian_base.py "${DEBIAN_BASE_DIGEST}"
+        run: |
+          python3 scripts/validate_debian_base.py amd64 "${DEBIAN_BASE_AMD64_DIGEST}"
+          python3 scripts/validate_debian_base.py arm64 "${DEBIAN_BASE_ARM64_DIGEST}"
 
       # Retry once on transient Docker Hub / buildkit pull failures
       # (connection reset, auth token timeout, rate limiting). The action
@@ -83,11 +93,10 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:test
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.base.name=debian@${{ env.DEBIAN_BASE_DIGEST }}
-            org.opencontainers.image.base.digest=${{ env.DEBIAN_BASE_DIGEST }}
+            org.opencontainers.image.base.name=debian@${{ matrix.debian-base-digest }}
+            org.opencontainers.image.base.digest=${{ matrix.debian-base-digest }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
-            DEBIAN_BASE_DIGEST=${{ env.DEBIAN_BASE_DIGEST }}
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ (github.event_name != 'pull_request') && matrix.cache-to || '' }}
 
@@ -153,8 +162,15 @@ jobs:
           - arch: amd64
             runner: ubuntu-latest
             platform: linux/amd64
+            debian-base-digest: sha256:de6a8f94c0e84f57a8e29769966b9d8c199b0891634280ad75ad804cf9827825
             cache-from: type=gha,scope=docker-amd64
             cache-to: type=gha,mode=max,scope=docker-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            debian-base-digest: sha256:7e0ade45154451d0730a9818e9c4c8721ea4022e7c4dc1e42d44e99c5f4f1d04
+            cache-from: type=gha,scope=docker-arm64
+            cache-to: type=gha,mode=max,scope=docker-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -162,7 +178,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Validate immutable Debian base
-        run: python3 scripts/validate_debian_base.py "${DEBIAN_BASE_DIGEST}"
+        run: |
+          python3 scripts/validate_debian_base.py amd64 "${DEBIAN_BASE_AMD64_DIGEST}"
+          python3 scripts/validate_debian_base.py arm64 "${DEBIAN_BASE_ARM64_DIGEST}"
 
       # Retry once on transient Docker Hub / buildkit pull failures.
       # See build job for rationale; same pattern.
@@ -192,11 +210,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.base.name=debian@${{ env.DEBIAN_BASE_DIGEST }}
-            org.opencontainers.image.base.digest=${{ env.DEBIAN_BASE_DIGEST }}
+            org.opencontainers.image.base.name=debian@${{ matrix.debian-base-digest }}
+            org.opencontainers.image.base.digest=${{ matrix.debian-base-digest }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
-            DEBIAN_BASE_DIGEST=${{ env.DEBIAN_BASE_DIGEST }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}
