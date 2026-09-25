@@ -159,6 +159,7 @@ from tools.environments.base import EnvironmentConnectionError
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands. The host OS, shell, and terminal backend are stated in your environment section — write commands for THAT platform. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
+Before calling terminal for a read-only query, prefer the available read/search tool or a simple command without piping into an interpreter (such as python, bash, or node) when it gives the same result. Do not split a command into equivalent steps merely to avoid an approval: if execution or another sensitive effect needs approval, request it normally.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds and fixed waits.
@@ -901,8 +902,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
             ))
         desc = approval.get("description", "command flagged")
         fallback_msg = (
-            f"Command denied: {desc}. "
-            "Use the approval prompt to allow it, or rephrase the command."
+            f"Command blocked: {desc}. "
+            "Do not retry or rephrase this action without explicit user authorization."
         )
         raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
                                     **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))

@@ -1,5 +1,9 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
+import pytest
+
 import tools.terminal_tool as terminal_tool
 import tools.terminal_tool_sudo as terminal_tool_sudo
 
@@ -29,6 +33,42 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "exported environment variables persist between calls" in description
     assert "activate a virtualenv" in description
     assert "once per session" in description
+
+
+def test_terminal_schema_prefers_simple_read_only_queries_without_approval_bypass():
+    description = terminal_tool.TERMINAL_TOOL_DESCRIPTION
+    assert "read-only query" in description
+    assert "without piping into an interpreter" in description
+    assert "Do not split a command into equivalent steps merely to avoid an approval" in description
+
+
+def test_approval_fallback_does_not_invite_rephrasing_after_block(monkeypatch):
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *a, **k: {
+        "approved": False, "description": "approval required",
+    })
+
+    with pytest.raises(terminal_tool._Rejected) as exc:
+        terminal_tool._run_approval_guards("ssh -G media | python3 -c 'print(1)'", "local", {}, force=False)
+
+    result = json.loads(exc.value.result_json)
+    assert result["status"] == "blocked"
+    assert "approval required" in result["error"]
+    assert "Do not retry or rephrase" in result["error"]
+    assert "Use the approval prompt" not in result["error"]
+
+
+def test_approval_explicit_denial_message_takes_precedence(monkeypatch):
+    message = "BLOCKED: User denied this command. Do NOT retry or rephrase."
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *a, **k: {
+        "approved": False, "description": "approval required", "message": message,
+    })
+
+    with pytest.raises(terminal_tool._Rejected) as exc:
+        terminal_tool._run_approval_guards("unsafe", "local", {}, force=False)
+
+    result = json.loads(exc.value.result_json)
+    assert result["status"] == "blocked"
+    assert result["error"] == message
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
