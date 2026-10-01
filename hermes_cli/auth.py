@@ -1537,6 +1537,8 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    token_bases: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+    known_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1556,6 +1558,12 @@ def write_credential_pool(
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
+    token_bases = token_bases or {}
+    known = set(known_ids) if known_ids is not None else set()
+    token_fields = (
+        "access_token", "refresh_token", "last_refresh", "id_token",
+        "expires_at", "expires_at_ms",
+    )
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -1575,19 +1583,37 @@ def write_credential_pool(
             for entry in existing_list
             if isinstance(entry, dict) and entry.get("id")
         }
-        new_ids = {
-            entry.get("id")
-            for entry in sanitized_entries
-            if isinstance(entry, dict) and entry.get("id")
-        }
-        merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
-            )
-            if isinstance(entry, dict)
-            else entry
-            for entry in sanitized_entries
-        ]
+        merged: List[Dict[str, Any]] = []
+        new_ids = set()
+        for entry in sanitized_entries:
+            if not isinstance(entry, dict):
+                merged.append(entry)
+                continue
+            entry_id = entry.get("id")
+            if entry_id in removed:
+                continue
+            disk_entry = existing_by_id.get(entry_id)
+            # Independent Codex accounts have no singleton authority. Token
+            # changes require an exact prior pair, never timestamp ordering.
+            if (provider_id == "openai-codex"
+                    and entry.get("source") == "manual:device_code"
+                    and entry.get("auth_type") == "oauth"):
+                if disk_entry is None and (
+                    entry_id in known or entry_id in token_bases
+                ):
+                    continue
+                if disk_entry is not None:
+                    disk_pair = (disk_entry.get("access_token"), disk_entry.get("refresh_token"))
+                    if token_bases.get(entry_id) != disk_pair:
+                        entry = dict(entry)
+                        for field in token_fields:
+                            if field in disk_entry:
+                                entry[field] = disk_entry[field]
+                            else:
+                                entry.pop(field, None)
+            if entry_id:
+                new_ids.add(entry_id)
+            merged.append(_merge_disk_cooldown_state(entry, disk_entry, provider_id))
         for disk_entry in existing_list:
             if not isinstance(disk_entry, dict):
                 continue
@@ -3563,8 +3589,10 @@ def _sync_codex_pool_entries(
     # is the right default for first-ever-save or a freshly initialized
     # auth.json).
     prev_at = None
+    prev_rt = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+        prev_rt = previous_singleton_tokens.get("refresh_token") or None
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -3579,7 +3607,9 @@ def _sync_codex_pool_entries(
             # own distinct token material is an independent account and must
             # be left alone (#39236).
             refresh_this_entry = bool(
-                prev_at and entry.get("access_token") == prev_at
+                prev_at and prev_rt
+                and entry.get("access_token") == prev_at
+                and entry.get("refresh_token") == prev_rt
             )
         else:
             # ``manual:api_key`` and any future non-device-code sources.

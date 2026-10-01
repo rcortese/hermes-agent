@@ -601,6 +601,16 @@ class CredentialPool:
         # never converge to "no available entries" and the caller's 401 retry
         # loop runs unbounded and non-interruptible.  Reset whenever a real
         # entry is identified or an escape path returns None.
+        self._known_manual_ids: Set[str] = set()
+        if provider == "openai-codex" and any(
+            entry.source == "manual:device_code" for entry in entries
+        ):
+            input_ids = {entry.id for entry in entries if entry.source == "manual:device_code"}
+            self._known_manual_ids = {
+                row["id"] for row in read_credential_pool(provider)
+                if isinstance(row, dict) and row.get("id") in input_ids
+                and row.get("source") == "manual:device_code"
+            }
         self._unmatched_rotation_streak: int = 0
 
     def has_credentials(self) -> bool:
@@ -659,12 +669,40 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in self._entries],
-            removed_ids=removed_ids,
-        )
+    def _persist(
+        self, *, removed_ids: Optional[List[str]] = None,
+        token_bases: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+    ) -> None:
+        if self.provider != "openai-codex":
+            write_credential_pool(
+                self.provider, [entry.to_dict() for entry in self._entries],
+                removed_ids=removed_ids,
+            )
+            return
+        with _auth_store_lock():
+            write_credential_pool(
+                self.provider, [entry.to_dict() for entry in self._entries],
+                removed_ids=removed_ids, token_bases=token_bases,
+                known_ids=self._known_manual_ids,
+            )
+            persisted = {
+                row.get("id"): row for row in read_credential_pool(self.provider)
+                if isinstance(row, dict)
+            }
+            entries = []
+            for entry in self._entries:
+                if entry.source != "manual:device_code" or entry.auth_type != AUTH_TYPE_OAUTH:
+                    entries.append(entry)
+                    continue
+                row = persisted.get(entry.id)
+                if row is not None:
+                    entries.append(PooledCredential.from_dict(self.provider, row))
+                    self._known_manual_ids.add(entry.id)
+                elif entry.id not in self._known_manual_ids and entry.id not in (token_bases or {}):
+                    entries.append(entry)
+                elif self._current_id == entry.id:
+                    self._current_id = None
+            self._entries = entries
 
     def _is_terminal_auth_failure(
         self,
@@ -1123,7 +1161,57 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    def _refresh_manual_codex_entry(
+        self, entry: PooledCredential, *, force: bool,
+    ) -> Optional[PooledCredential]:
+        """Refresh one independent account under the shared single-use lock."""
+        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+            row = next((
+                row for row in read_credential_pool(self.provider)
+                if isinstance(row, dict) and row.get("id") == entry.id
+            ), None)
+            if row is None:
+                self._entries = [item for item in self._entries if item.id != entry.id]
+                self._known_manual_ids.add(entry.id)
+                if self._current_id == entry.id:
+                    self._current_id = None
+                return None
+            stored = PooledCredential.from_dict(self.provider, row)
+            self._replace_entry(entry, stored)
+            self._known_manual_ids.add(entry.id)
+            if (stored.access_token != entry.access_token
+                    or stored.refresh_token != entry.refresh_token):
+                # A 401/force caller may still hold the loser's old access token.
+                return stored
+            if not stored.refresh_token:
+                if force:
+                    self._mark_exhausted(stored, None)
+                return None
+            old_pair = (stored.access_token, stored.refresh_token)
+            try:
+                refreshed = auth_mod.refresh_codex_oauth_pure(
+                    stored.access_token, stored.refresh_token,
+                )
+            except Exception as exc:
+                logger.debug("Manual Codex refresh failed for %s: %s", entry.id, exc)
+                self._mark_exhausted(stored, None)
+                return None
+            updated = replace(
+                stored, access_token=refreshed["access_token"],
+                refresh_token=refreshed["refresh_token"],
+                last_refresh=refreshed.get("last_refresh"),
+                last_status=STATUS_OK, last_status_at=None,
+                last_error_code=None, last_error_reason=None,
+                last_error_message=None, last_error_reset_at=None,
+            )
+            self._replace_entry(stored, updated)
+            self._persist(token_bases={stored.id: old_pair})
+            return next((item for item in self._entries if item.id == stored.id), None)
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if (self.provider == "openai-codex" and entry.source == "manual:device_code"
+                and entry.auth_type == AUTH_TYPE_OAUTH):
+            return self._refresh_manual_codex_entry(entry, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1149,11 +1237,10 @@ class CredentialPool:
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
-                    if synced is not entry:
-                        entry = synced
-                        if not force and not self._entry_needs_refresh(entry):
-                            return entry
-                    return self._refresh_entry_impl(entry, force=force)
+                    if (synced.access_token != entry.access_token
+                            or synced.refresh_token != entry.refresh_token):
+                        return synced
+                    return self._refresh_entry_impl(synced, force=force)
                 if (
                     synced.access_token != entry.access_token
                     or synced.refresh_token != entry.refresh_token
@@ -2053,11 +2140,14 @@ class CredentialPool:
                 replace(entry, priority=new_priority)
                 for new_priority, entry in enumerate(self._entries)
             ]
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
+            if self.provider == "openai-codex":
+                self._persist(removed_ids=[removed.id])
+            else:
+                write_credential_pool(
+                    self.provider,
+                    [entry.to_dict() for entry in self._entries],
+                    removed_ids=[removed.id],
+                )
             if self._current_id == removed.id:
                 self._current_id = None
             return removed

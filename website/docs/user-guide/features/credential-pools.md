@@ -208,6 +208,14 @@ This means subagents benefit from the same rate-limit resilience as the parent, 
 
 The credential pool uses a threading lock for all state mutations (`select()`, `mark_exhausted_and_rotate()`, `try_refresh_current()`, `mark_used()`). This ensures safe concurrent access when the gateway handles multiple chat sessions simultaneously.
 
+## Shared Codex OAuth refresh
+
+Manually added `openai-codex` OAuth entries (`manual:device_code`) are pool-owned credentials. Cooperating processes sharing the same auth store and file lock serialize the disk reread, refresh, and persistence. If either token changed since a caller's snapshot, it adopts the stored pair instead of refreshing again, including on a forced 401 retry.
+
+Ordinary status and counter writes preserve the on-disk token generation; refresh writes require an exact match against the prior access/refresh pair. Stale pools do not resurrect entries they previously observed on disk after removal, and refreshing one account leaves peer accounts intact. Legacy `device_code` entries remain singleton-backed: singleton saves update manual aliases only when both previous tokens match. Manual entries never adopt tokens through the singleton read-sync path.
+
+These guarantees require all writers to cooperate with the same file lock. They do not provide distributed locking or repair tokens already consumed outside this protocol.
+
 ## Architecture
 
 For the full data flow diagram, see [`docs/credential-pool-flow.excalidraw`](https://excalidraw.com/#json=2Ycqhqpi6f12E_3ITyiwh,c7u9jSt5BwrmiVzHGbm87g) in the repository.
