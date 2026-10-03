@@ -1212,6 +1212,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    category_route=None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1454,11 +1455,18 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    if category_route is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        child_reasoning = parse_reasoning_effort(category_route.reasoning_effort)
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if category_route is not None:
+        parent_fallback = []  # Configured category must never escalate models.
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1543,6 +1551,10 @@ def _build_child_agent(
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if category_route is not None:
+        from tools.delegation_categories import install_category_loop_budget
+
+        install_category_loop_budget(child, category_route)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -2311,6 +2323,8 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+        category_error = (result.get("error")
+                          if isinstance(getattr(child, "_delegation_category_receipt", None), dict) else None)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
@@ -2321,6 +2335,8 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif category_error:
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2370,6 +2386,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif category_error:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
@@ -2417,6 +2435,12 @@ def _run_single_child(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if isinstance(getattr(child, "_delegation_category_receipt", None), dict):
+            entry["provider"] = getattr(child, "provider", None)
+            if category_error:
+                entry["error"] = category_error
+            if result.get("category_budget_exhausted") is True:
+                entry["category_budget_exhausted"] = True
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -2851,16 +2875,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2893,8 +2907,27 @@ def delegate_task(
             return tool_error(
                 f"Task {i} must be an object, got {type(task).__name__}."
             )
-        if not task.get("goal", "").strip():
+        if not isinstance(task.get("goal"), str) or not task["goal"].strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Pure whole-batch validation precedes credentials, transcripts and agents.
+    from tools.delegation_categories import validate_category_routes
+
+    try:
+        category_routes = validate_category_routes(
+            cfg, task_list, max_iterations=max_iterations
+        )
+        if category_routes is None:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+            child_credentials = [creds] * len(task_list)
+        else:
+            child_credentials = [
+                _resolve_delegation_credentials(route.credentials_cfg(), parent_agent)
+                for route in category_routes
+            ]
+            creds = child_credentials[0]  # Background envelope metadata only.
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2937,6 +2970,9 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        creds = child_credentials[i]
+        category_route = category_routes[i] if category_routes is not None else None
+        category_kwargs = {"category_route": category_route} if category_route is not None else {}
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -2948,7 +2984,7 @@ def delegate_task(
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
             model=creds["model"],
-            max_iterations=effective_max_iter,
+            max_iterations=category_route.max_iterations if category_route else effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
             override_provider=creds["provider"],
@@ -2960,6 +2996,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            **category_kwargs,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3116,6 +3153,18 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # Category receipts also cover timeout/interruption/error batch entries.
+        if category_routes is not None:
+            for entry in results:
+                index = entry["task_index"]
+                entry.update(category_routes[index].receipt())
+                child = children[index][2]
+                reported_calls = getattr(child, "_delegation_category_api_calls", None)
+                if type(reported_calls) is int:
+                    entry["api_calls"] = max(entry.get("api_calls", 0), reported_calls)
+                if getattr(child, "_delegation_category_accounting_unknown", False) is True:
+                    entry["category_accounting_unknown"] = True
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
@@ -3322,7 +3371,8 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=(child_credentials[0]["model"] if category_routes is not None and n_tasks == 1
+                   else None if category_routes is not None else creds["model"]),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3872,6 +3922,11 @@ DELEGATE_TASK_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "goal": {"type": "string", "description": "Task goal"},
+                        "category": {
+                            "type": "string",
+                            "enum": ["simples", "analitica", "complexa"],
+                            "description": "Operator-configured task category (default analitica). Requires delegation.categories; use tasks with one item to categorize a single task.",
+                        },
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
@@ -3938,6 +3993,9 @@ _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     if not isinstance(tasks, list):
+        return tasks
+    if "categories" in _load_config():
+        # Category mode rejects overrides rather than silently dropping them.
         return tasks
     stripped_tasks = []
     changed = False

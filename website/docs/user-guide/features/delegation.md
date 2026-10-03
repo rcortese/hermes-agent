@@ -31,6 +31,99 @@ delegate_task(tasks=[
 ])
 ```
 
+## Fork-local task categories (opt-in)
+
+This fork supports operator-controlled routing through `delegation.categories`.
+The table's presence enables category mode; an absent table retains legacy
+provider/model credentials and iteration configuration. An empty or invalid table
+fails closed rather than reverting to legacy routing.
+
+Configure all three entries in `config.yaml` (replace these illustrative model
+identifiers with models available from your configured provider):
+
+```yaml
+delegation:
+  categories:
+    simples:
+      model: gpt-6-luna
+      provider: openai-codex
+      reasoning_effort: low
+      allowed_models: [gpt-6-luna]
+      fallback_providers: []
+      max_iterations: 40
+    analitica:
+      model: gpt-6-luna
+      provider: openai-codex
+      reasoning_effort: medium
+      allowed_models: [gpt-6-luna]
+      fallback_providers: []
+      max_iterations: 80
+    complexa:
+      model: gpt-6.1-sol
+      provider: openai-codex
+      reasoning_effort: high
+      allowed_models: [gpt-6.1-sol]
+      fallback_providers: []
+      max_iterations: 120
+```
+
+`max_iterations` may be omitted: defaults/ceilings are 40, 80 and 120,
+respectively. An operator may lower each positive integer limit but not raise
+it above its category ceiling. `model`, `provider`, `reasoning_effort` and
+`allowed_models` and `fallback_providers: []` are required. Only an empty list is
+accepted for fallback providers. Reasoning accepts only the exact strings `low`,
+`medium`, `high`; booleans, whitespace and coercion are rejected. These model
+examples do not establish model availability, price or verified cost savings.
+Model membership is checked exactly against the
+local allowlist (no spelling normalization or remote catalog lookup).
+
+Select a category only on each `tasks` item; a one-item array handles a single
+categorized task. Omitted category defaults to `analitica`, including `goal`-only
+calls. Explicit null, unknown or misspelled categories are errors.
+
+```python
+delegate_task(tasks=[
+    {"goal": "Inspect the failing assertion", "category": "simples"},
+    {"goal": "Compare the implementation alternatives"},
+    {"goal": "Analyze the concurrency invariant", "category": "complexa"},
+])
+```
+
+Category-mode task objects accept only `goal`, `context`, `role` and `category`.
+This fork does not currently support task `output_schema`, `images` or `group`;
+those runtime fields are not silently accepted or implemented here.
+They cannot override model, provider, iteration budget, tools, endpoints,
+credentials or reasoning. Endpoints and secrets stay in trusted provider
+configuration/auth stores, not task payloads or category rows. The whole table
+and batch are validated before resolving any credentials, creating transcripts
+or constructing children. Credentials are then resolved separately per child
+using the existing runtime-provider resolver; resolution failure prevents all
+child construction. This is validation atomicity, not transactional rollback
+of provider auth refreshes or later constructor failures.
+
+Each child receives its category's reasoning configuration and an empty model
+fallback chain: there is no automatic escalation to the parent's fallback model.
+Existing credential rotation for the selected provider remains available.
+Results include `category`, `configured_max_iterations`, `reasoning_effort`,
+`configured_provider` and `configured_model`; the existing `model` field still
+identifies the child model.
+
+**Budget semantics:** limits govern the agent loop's reported `api_calls`, not
+HTTP requests. Re-entering a child's conversation receives only the remaining
+allowance; an exhausted allowance skips the next conversation and returns the
+previous outcome with an exhaustion marker (or re-raises the original exception),
+never replacing its error with a budget error. This fork has no task output-schema
+retry feature; no schema retry is introduced or exercised by this implementation.
+Reported usage aggregates across actual entries, and original
+completion/interruption flags are not rewritten. Missing/invalid usage accounting
+or an exception consumes the remaining allowance fail-closed, without inventing
+reported calls; result receipts flag unknown accounting. This does not add a schema
+retry policy or limit transport-internal HTTP retries, schema recovery within a
+loop call, or the existing finalizer/grace call. Thus it is not a strict request
+or monetary cap. The existing concurrency default of three, depth, pause,
+approval, interrupt and background controls are unchanged; this feature does
+not introduce a process-global concurrency scheduler.
+
 ## How Subagent Context Works
 
 :::warning Critical: Subagents Know Nothing
