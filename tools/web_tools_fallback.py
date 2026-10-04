@@ -17,6 +17,16 @@ def _normalize_backend_names(raw):
     return names
 
 
+def _has_explicit_search_fallback_policy():
+    """Key presence is authoritative, even for empty/null/invalid chains.
+
+    Zero normalized alternatives means primary-only, not legacy rescue.
+    Only an absent key preserves the never-configured default behavior.
+    """
+    from tools.web_tools import _load_web_config
+    return "search_fallback_backends" in _load_web_config()
+
+
 def _get_search_fallback_backends(primary_backend=""):
     from tools.web_tools import _load_web_config
     return [name for name in _normalize_backend_names(_load_web_config().get("search_fallback_backends"))
