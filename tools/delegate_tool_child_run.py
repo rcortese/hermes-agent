@@ -611,6 +611,12 @@ def _build_result_entry(
         "_child_role": getattr(child, "_delegate_role", None),
         "_child_cost_usd": float(_cost or 0.0) if isinstance(_cost, (int, float)) else 0.0,
     }
+    receipt = getattr(child, "_delegation_category_receipt", None)
+    if isinstance(receipt, dict):
+        entry.update(receipt)
+        entry["api_calls"] = getattr(child, "_delegation_category_api_calls", entry["api_calls"])
+        if getattr(child, "_delegation_category_accounting_unknown", False):
+            entry["category_accounting_unknown"] = True
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"

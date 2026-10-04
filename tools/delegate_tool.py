@@ -199,6 +199,8 @@ def _build_child_agent(
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
+    if isinstance(routing_cfg, dict) and routing_cfg.get("reasoning_effort"):
+        delegation_cfg = {**delegation_cfg, "reasoning_effort": routing_cfg["reasoning_effort"]}
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
@@ -363,24 +365,24 @@ def _run_single_child(
 
 
 def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Any, *,
+    top_role: str, max_iterations: int, parent_agent, routing_cfg: Any,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
-    }
+    overrides = {}
     children = []
     for i, t in enumerate(task_list):
+        selected_creds = creds[i] if isinstance(creds, list) else creds
+        selected_route = routing_cfg[i] if isinstance(routing_cfg, list) else routing_cfg
+        child_overrides = {**overrides, "routing_cfg": selected_route,
+            "override_provider": selected_creds["provider"], "override_base_url": selected_creds["base_url"],
+            "override_api_key": selected_creds["api_key"], "override_api_mode": selected_creds["api_mode"],
+            "override_request_overrides": selected_creds.get("request_overrides"),
+            "override_acp_command": selected_creds.get("command"), "override_acp_args": selected_creds.get("args")}
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -389,8 +391,8 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=selected_creds["model"], max_iterations=selected_route.get("max_iterations", max_iterations), task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **child_overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -491,12 +493,6 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
-    try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
@@ -505,6 +501,19 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    from tools.delegation_categories import validate_category_routes
+    try:
+        category_routes = validate_category_routes(routing_cfg, task_list, max_iterations=max_iterations)
+        if category_routes is None:
+            creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+            per_task_creds = creds
+            per_task_cfg = routing_cfg
+        else:
+            per_task_cfg = [{**route.credentials_cfg(), "max_iterations": route.max_iterations} for route in category_routes]
+            per_task_creds = [_resolve_delegation_credentials(route_cfg, parent_agent) for route_cfg in per_task_cfg]
+            creds = per_task_creds[0]  # batch metadata; actual routes stay per-task
+    except ValueError as exc:
+        return tool_error(str(exc))
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -520,11 +529,15 @@ def delegate_task(
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_list, task_schemas, per_task_creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+        routing_cfg=per_task_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
         return tool_error(err)
+    if category_routes is not None:
+        from tools.delegation_categories import install_category_loop_budget
+        for (_, _, child), route in zip(children, category_routes):
+            install_category_loop_budget(child, route)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
@@ -653,6 +666,8 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "category": _p("string", "Config-owned task difficulty; defaults to analitica. Requires delegation.categories.",
+                                       enum=["simples", "analitica", "complexa"]),
                         "goal": _p(
                             "string",
                             "What this subagent should accomplish. Be specific and self-contained — it knows "

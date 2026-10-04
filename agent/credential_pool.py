@@ -1005,6 +1005,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # entries" and the caller's 401 retry loop runs unbounded. Reset when a
         # real entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        input_ids = {e.id for e in entries if e.source == "manual:device_code"}
+        self._known_manual_ids = {
+            row["id"] for row in read_credential_pool(provider)
+            if isinstance(row, dict) and row.get("id") in input_ids
+        } if provider == "openai-codex" and input_ids else set()
 
     # ---- read accessors ---------------------------------------------------
 
@@ -1112,9 +1117,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         *,
         removed_ids: Optional[List[str]] = None,
         status_cleared_ids: Optional[List[str]] = None,
+        token_bases: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
     ) -> None:
         # Self-locking: snapshotting self._entries must not race a rotation.
         with self._lock:
+            if self.provider == "openai-codex" and (self._known_manual_ids or any(e.source == "manual:device_code" for e in self._entries)):
+                from agent.credential_pool_codex_generations import persist_manual_pool
+                persist_manual_pool(self, removed_ids=removed_ids, token_bases=token_bases,
+                                    status_cleared_ids=status_cleared_ids)
+                return
             persist_pool_entries(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
@@ -1469,6 +1480,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- refresh -----------------------------------------------------------
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if (self.provider == "openai-codex" and entry.source == "manual:device_code"
+                and entry.auth_type == AUTH_TYPE_OAUTH):
+            from agent.credential_pool_codex_generations import refresh_manual_entry
+            return refresh_manual_entry(self, entry, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1489,7 +1504,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
             if self.provider == "openai-codex":
                 synced = self._sync_entry_from_auth_store(entry)
-                if synced is not entry and not force and not self._entry_needs_refresh(synced):
+                if synced.access_token != entry.access_token or synced.refresh_token != entry.refresh_token:
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
             synced = self._sync_entry_from_pool_store(entry)

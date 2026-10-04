@@ -19,6 +19,12 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_auth_root(monkeypatch):
+    # Profile fixtures select synthetic homes; inherited shared authority is not a fixture.
+    monkeypatch.delenv("HERMES_AUTH_HOME", raising=False)
+
+
 def _make_auth_store(pool: dict | None = None, providers: dict | None = None) -> dict:
     store: dict = {"version": 1}
     if pool is not None:

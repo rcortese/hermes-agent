@@ -136,10 +136,12 @@ def _sync_codex_pool_entries(
         return
     # None/empty prev_at → no manual entry can be an alias (right default for a first-ever save).
     prev_at = (previous_singleton_tokens or {}).get("access_token") or None
+    prev_rt = (previous_singleton_tokens or {}).get("refresh_token") or None
     for entry in _codex_pool_dicts(entries):
         source = entry.get("source")
         is_alias = source == "manual:device_code" and bool(
-            prev_at and entry.get("access_token") == prev_at)
+            prev_at and prev_rt and entry.get("access_token") == prev_at
+            and entry.get("refresh_token") == prev_rt)
         if not (source == "device_code" or is_alias):
             continue
         entry["access_token"] = access_token

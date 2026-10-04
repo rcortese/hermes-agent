@@ -976,6 +976,8 @@ def write_credential_pool(
     provider_id: str, entries: List[Dict[str, Any]], *,
     removed_ids: Optional[Iterable[str]] = None,
     status_cleared_ids: Optional[Iterable[str]] = None,
+    token_bases: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+    known_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -995,6 +997,10 @@ def write_credential_pool(
         existing_list = pool.get(provider_id)
         existing_list = existing_list if isinstance(existing_list, list) else []
         existing_by_id = _entry_ids(existing_list)
+        from hermes_cli.auth_pool_generations import merge_manual_codex_generations
+        sanitized = merge_manual_codex_generations(
+            provider_id, sanitized, existing_by_id, token_bases or {}, set(known_ids or ()), removed,
+        )
         new_ids = set(_entry_ids(sanitized))
         status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: List[Dict[str, Any]] = [

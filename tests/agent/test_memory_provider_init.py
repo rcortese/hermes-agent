@@ -2,6 +2,18 @@
 
 from types import SimpleNamespace
 from unittest.mock import patch
+import pytest
+
+
+@pytest.mark.parametrize("platform", [None, "cli", "cron", "subagent", "api_server", "feishu", "desktop"])
+def test_surface_boundary_rejects_automation_even_with_memory_toolset(platform, monkeypatch):
+    from agent.agent_init import _init_memory
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    agent = SimpleNamespace(session_id="synthetic", enabled_toolsets=["memory"], disabled_toolsets=[])
+    with patch("agent.memory_manager.inject_memory_provider_tools"), patch("plugins.memory.load_memory_provider") as load:
+        _init_memory(agent, {"memory": {"provider": "honcho"}}, False, platform, memory_manager=object())
+    assert agent._memory_manager is None and agent._memory_store is None
+    load.assert_not_called()
 
 
 class RecordingMemoryProvider:
@@ -114,7 +126,7 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
             skip_context_files=True,
             skip_memory=False,
             session_id="sess-alt",
-            platform="feishu",
+            platform="webui",
             user_id="open-id",
             user_id_alt="union-id",
         )
@@ -123,7 +135,7 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_session_id == "sess-alt"
     assert provider.init_kwargs["user_id"] == "open-id"
     assert provider.init_kwargs["user_id_alt"] == "union-id"
-    assert provider.init_kwargs["platform"] == "feishu"
+    assert provider.init_kwargs["platform"] == "webui"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
 
@@ -173,13 +185,13 @@ def test_core_tool_names_rejected_from_memory_routing_table():
 
 
 def test_aiagent_reuses_handed_in_memory_manager_without_reinitializing():
-    """A caller that rebuilds the agent per turn (gateway api_server) hands back the session's manager:
+    """A human-surface caller that rebuilds the agent per turn hands back the session's manager:
     the provider keeps its state — no second load, no second initialize (#120116)."""
     provider = RecordingMemoryProvider()
     cfg = {"memory": {"provider": "recording"}, "agent": {}}
     common = dict(
         api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
-        skip_context_files=True, skip_memory=False, session_id="sess-api", platform="api_server",
+        skip_context_files=True, skip_memory=False, session_id="sess-api", platform="webui",
     )
     with (
         patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),

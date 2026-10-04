@@ -57,10 +57,12 @@ def _submit_api_worker(loop, fn):
     global _API_WORKER_LIVE
     with _API_WORKER_LOCK:
         _API_WORKER_LIVE += 1
+    from contextvars import copy_context
+    worker_context = copy_context()
 
     def _counted():
         try:
-            return fn()
+            return worker_context.run(fn)
         finally:
             global _API_WORKER_LIVE
             with _API_WORKER_LOCK:

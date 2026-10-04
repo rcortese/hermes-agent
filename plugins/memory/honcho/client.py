@@ -603,11 +603,21 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
     See #69123, #74065.
     """
+    from agent.moss_memory_gate import moss_runtime, policy
+    if moss_runtime():
+        if config is None:
+            config = HonchoClientConfig.from_global_config()
+        approved = policy()
+        if (not approved or config.workspace_id != approved["workspace"]
+                or config.base_url != approved["base_url"]
+                or config.api_key not in (None, "", "local")):
+            raise ValueError("Moss Honcho workspace/destination mismatch")
     key = _client_cache_key(config)
     slot = _slot_for(key)
     cached = slot.peek()
     if cached is not None:
-        _refresh_oauth(config, cached, slot)
+        if not moss_runtime():
+            _refresh_oauth(config, cached, slot)
         refreshed = slot.peek()
         if refreshed is not None:
             return refreshed
@@ -617,7 +627,8 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         config = HonchoClientConfig.from_global_config()
 
     # Start with a live access token rather than 401ing an hour in.
-    _refresh_oauth(config)
+    if not moss_runtime():
+        _refresh_oauth(config)
 
     if not config.api_key and not config.base_url:
         raise ValueError("Honcho API key not found. Get your API key at https://app.honcho.dev, "
@@ -666,6 +677,15 @@ def _build_client(config: HonchoClientConfig) -> "Honcho":
     explicit_key = _host_block(raw, config.host).get("apiKey") or raw.get("apiKey")
     api_key = "local" if _is_local_base_url(base_url) and not explicit_key else config.api_key
     kwargs: dict = {"workspace_id": config.workspace_id, "api_key": api_key, "environment": config.environment, "timeout": timeout}
+    from agent.moss_memory_gate import moss_runtime, policy, safe_http_client
+    if moss_runtime():
+        approved = policy()
+        if (not approved or config.workspace_id != approved["workspace"]
+                or base_url != approved["base_url"] or config.api_key not in (None, "", "local")
+                or explicit_key not in (None, "", "local")):
+            raise ValueError("Moss Honcho workspace/destination mismatch")
+        kwargs["api_key"] = "local"
+        kwargs["http_client"] = safe_http_client(base_url, timeout, api_key="local")
     if base_url:
         # The SDK's route builders already carry the version prefix ("/v3/..."), so
         # strip a trailing version segment from any base_url to avoid "/v3/v3/...".

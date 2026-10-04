@@ -1007,6 +1007,9 @@ def cmd_status(args) -> None:
 
     if not (hcfg.enabled and (hcfg.api_key or hcfg.base_url)):
         return print(f"\n  Not connected ({'disabled' if not hcfg.enabled else 'no API key or base URL'})\n")
+    from agent.moss_memory_gate import read_only_status
+    if read_only_status(hcfg):
+        return
     print("\n  Connection... ", end="", flush=True)
     try:
         _show_peer_cards(hcfg, get_honcho_client(hcfg))

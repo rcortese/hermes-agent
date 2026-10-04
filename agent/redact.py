@@ -795,6 +795,9 @@ def _assignment_sub(render, *, check_keyword: bool):
     """re.sub callback: keep the match unless the key/value pair (groups[0], groups[-1]) needs redaction."""
     def _sub(m):
         groups = m.groups()
+        # Exact bounded Honcho resource limit; opaque values remain protected.
+        if groups[0] == "token_budget" and re.fullmatch(r"[0-9]{1,9}", groups[-1]):
+            return m.group(0)
         if not _should_redact_assignment(groups[0], groups[-1], check_keyword=check_keyword):
             return m.group(0)
         return render(groups)

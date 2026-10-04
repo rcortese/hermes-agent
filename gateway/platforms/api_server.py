@@ -1576,7 +1576,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     family_token = _api_request_browser_control_transport_family.set(
                         self._browser_control_transport_family(request))
                     try:
-                        return await handler(request)
+                        from agent.moss_memory_gate import moss_runtime, request_admission, admission_scope
+                        admission = await request_admission(request, resolved_profile) if moss_runtime() else None
+                        with admission_scope(admission):
+                            return await handler(request)
                     finally:
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
@@ -3998,12 +4001,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
+        from agent.moss_memory_gate import api_admission, admission_scope
+        request_memory_admission = api_admission.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
 
         def _run():
             from gateway.session_context import clear_session_vars
-            with self._profile_scope(request_profile):
+            with self._profile_scope(request_profile), admission_scope(request_memory_admission):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",

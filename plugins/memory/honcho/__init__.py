@@ -219,6 +219,14 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Configure recall settings and start (or defer) Honcho session creation."""
+        from agent.moss_memory_gate import moss_runtime, eligible, api_admission
+        if moss_runtime():
+            if not eligible({**kwargs, "session_id": session_id}):
+                self._cron_skipped = True
+                return
+            admission = api_admission.get() if kwargs.get("platform") == "api_server" else None
+            kwargs["memory_conversation"] = admission["session_id"] if admission else session_id
+            kwargs["memory_surface"] = "webui" if admission else kwargs.get("platform", "unknown")
         self._recall_generation = object()
         try:
             agent_context, platform = kwargs.get("agent_context", ""), kwargs.get("platform", "cli")
@@ -275,6 +283,13 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def _resolve_session_key(self, cfg, session_id: str, **kwargs) -> str:
         """Resolve the Honcho session key without touching the network."""
+        from agent.moss_memory_gate import moss_runtime, policy
+        if moss_runtime():
+            if not policy():
+                raise ValueError("Moss memory policy missing")
+            import hashlib
+            ident = kwargs["memory_conversation"]
+            return "moss-" + kwargs["memory_surface"] + "-" + hashlib.sha256(ident.encode()).hexdigest()[:32]
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = kwargs.get("cwd") or str(resolve_agent_cwd())
@@ -452,7 +467,18 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         Live context (representation, card) is injected via prefetch()."""
         if self._cron_skipped or not (self._config or (self._manager and self._session_key)):
             return ""
-        return _PROMPT_HEADERS.get(self._recall_mode, _PROMPT_HEADERS["hybrid"])
+        header = _PROMPT_HEADERS.get(self._recall_mode, _PROMPT_HEADERS["hybrid"])
+        from agent.moss_memory_gate import moss_runtime
+        if moss_runtime():
+            header += (
+                "\nFor Rodolfo's conversational memory requests, use honcho_conclude; "
+                "do not substitute a Markdown file. Files remain appropriate for explicitly "
+                "requested technical artifacts. Confirm a saved memory only after the tool "
+                "reports success; report failures or pending writes honestly. For recall "
+                "verification use honcho_search or honcho_reasoning in the new conversation, "
+                "not local files or session history. Connectivity does not prove saving or recall."
+            )
+        return header
 
     @staticmethod
     def _resolve_injection_log_path(look: _HostLookup) -> Optional[str]:

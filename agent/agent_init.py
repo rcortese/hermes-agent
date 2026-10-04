@@ -27,6 +27,7 @@ from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
 from agent.memory_manager import StreamingContextScrubber
 from agent.memory_provider import is_core_memory_provider
+from agent.memory_surface_boundary import _should_skip_memory_for_runtime
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint, query_ollama_num_ctx
@@ -1257,6 +1258,12 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
 
 
 def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+    # A requested toolset cannot override the human-ingress persistence boundary.
+    boundary_skip = _should_skip_memory_for_runtime(
+        platform=platform, explicit_skip_memory=skip_memory, session_id=getattr(agent, "session_id", None),
+        gateway_session_key=getattr(agent, "gateway_session_key", None),
+    )
+    skip_memory = skip_memory or boundary_skip
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
@@ -1275,7 +1282,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         "memory" in (agent.enabled_toolsets or [])
         and "memory" not in (agent.disabled_toolsets or [])
     )
-    if not skip_memory or _memory_toolset_requested:
+    if not boundary_skip and (not skip_memory or _memory_toolset_requested):
         # Memory is optional — don't break agent init
         with suppress(Exception):
             from tools.memory_tool import (
