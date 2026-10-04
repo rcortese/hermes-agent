@@ -326,6 +326,13 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
 
     def _paid_search() -> tuple[dict, bool]:
         fetch_limit = bucket_limit(limit)
+        from tools.web_tools_fallback import _get_search_fallback_backends, ordered_search
+        if _get_search_fallback_backends(provider.name):
+            # Explicit configured chains are authoritative: never implicit rescue,
+            # and never cache fallback successes under the failed primary identity.
+            resp = ordered_search(provider, provider.name, query, fetch_limit)
+            fallback_used = resp.get("metadata", {}).get("fallback_from") is not None
+            return resp, fallback_used
         try:
             resp = provider.search(query, fetch_limit)
         except Exception as exc:  # noqa: BLE001 — candidate for rescue
