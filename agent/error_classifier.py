@@ -10,10 +10,12 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -814,6 +816,88 @@ def _nous_welcome_tier(c: _Ctx) -> Optional[Verdict]:
     return _v(_R.format_error, retryable=False, should_fallback=True, error_context=ctx)
 
 
+def _kimi_coding_limit(c: _Ctx) -> Optional[Verdict]:
+    """Coding membership caps are 403s, not bad credentials (Kimi error reference).
+
+    Route identity, not a provider/model nickname, scopes this exception. Open
+    Platform/Moonshot and other 403s retain their existing classification.
+    """
+    if c.status_code not in (403, 429):
+        return None
+    try:
+        route = urlsplit(c.base_url)
+        coding = route.path == "/coding" or route.path.startswith("/coding/")
+        if (route.scheme not in ("https", "http") or route.hostname not in {"api.kimi.ai", "api.kimi.com"}
+                or route.username is not None or not coding
+                or any(p in {".", ".."} for p in route.path.split("/"))):
+            return None
+    except ValueError:
+        return None
+    # Never let a quota mention in an auth, billing, or WAF refusal override it.
+    if (c.code in _BILLING_ERROR_CODES
+            or c.code in {"invalid_api_key", "authentication_error", "invalid_auth", "invalid_token",
+                          "auth_invalid", "invalid_credentials", "permission_denied"}
+            or any(p in c.msg for p in _BILLING_PATTERNS + _UPSTREAM_BLOCKED_PATTERNS)
+            or any(p in c.msg for p in ("invalid api key", "invalid_api_key", "authentication", "unauthorized",
+                                       "invalid token", "token expired", "token revoked"))):
+        return None
+    if ("concurrent request limit" in c.msg or "too many concurrent requests" in c.msg
+            or c.code in {"concurrent_request_limit", "concurrency_limit_exceeded"}):
+        return _v(_R.rate_limit, should_fallback=True, error_context={"limit_kind": "concurrency"})
+    period = re.search(r"\b(5[- ]hour|weekly|monthly)\s+(?:\(7-day\)\s+)?(?:usage|quota)\b", c.msg)
+    exhausted = any(p in c.msg for p in ("reached", "exceeded", "exhausted"))
+    if not ((period and exhausted) or c.code in {"usage_limit_reached", "quota_exhausted"}):
+        return None
+    ctx = {"limit_kind": "quota", "usage_limit_reached": True, "quota_exhausted": True,
+           "reason": "usage_limit_reached"}
+    if period:
+        ctx["quota_period"] = period.group(1).replace(" ", "-")
+    reset_at = _kimi_coding_reset_at(c)
+    if reset_at is not None:
+        ctx["reset_at"] = reset_at
+    else:
+        # A conservative re-probe policy, NOT an assertion about the provider's
+        # reset time. A period label (including 5-hour) supplies no remaining wait.
+        ctx.update(reset_unknown=True, retry_probe_after=3600)
+    return _v(_R.rate_limit, retryable=False, **_ROTATE_FALLBACK, error_context=ctx)
+
+
+def _kimi_coding_reset_at(c: _Ctx) -> Optional[float]:
+    """Prefer explicit absolute reset over relative hints; reject invalid/nonfinite values."""
+    from agent.credential_pool import _parse_absolute_timestamp
+    from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
+
+    now = time.time()
+    payloads = [p for p in (c.body, _error_obj(c.body)) if isinstance(p, dict)]
+    for payload in payloads:
+        for name in ("resets_at", "reset_at"):
+            value = payload.get(name)
+            epoch = None if isinstance(value, bool) else _parse_absolute_timestamp(value)
+            if epoch is not None and math.isfinite(epoch) and epoch > now:
+                return epoch
+    for name in ("x-ratelimit-reset", "X-RateLimit-Reset"):
+        epoch = _parse_absolute_timestamp(c.headers.get(name))
+        if epoch is not None and math.isfinite(epoch) and epoch > now:
+            return epoch
+    for payload in payloads:
+        for name in ("resets_in_seconds", "retry_after"):
+            seconds = parse_retry_after_seconds(payload.get(name))
+            if seconds is not None and math.isfinite(seconds) and seconds > 0:
+                return now + seconds
+    seconds = parse_retry_after_seconds(c.headers)
+    if seconds is None:
+        # Reuse the existing OpenAI-duration / Anthropic-ISO header grammar.
+        from agent.agent_runtime_helpers import _set_reset_from_vendor_headers
+        vendor_ctx = {}
+        _set_reset_from_vendor_headers(vendor_ctx, c.headers)
+        epoch = vendor_ctx.get("reset_at")
+        if epoch is not None and math.isfinite(epoch) and epoch > now:
+            return epoch
+    if seconds is None:
+        seconds = reset_delay_from_message(c.msg)
+    return now + seconds if seconds is not None and math.isfinite(seconds) and seconds > 0 else None
+
+
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
@@ -827,6 +911,9 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # Status-agnostic: the stream-relayed ban has no status, and a 403 variant is not a bad key.
     if any(p in msg for p in _ACCOUNT_POLICY_BLOCK_PATTERNS):
         return _V_POLICY_BLOCKED
+    kimi_limit = _kimi_coding_limit(c)
+    if kimi_limit is not None:
+        return kimi_limit
     # ChatGPT Codex masks a rejected encrypted-reasoning replay behind the same bare
     # ``invalid_prompt: Request blocked.`` it uses for real blocks (#92353). Exact envelope
     # + provider only. The verdict keeps format_error's abort-and-fallback hints; the one
@@ -993,7 +1080,10 @@ def _off_route_host(c: _Ctx) -> str:
     """The contacted host when ``base_url`` is set and is not the provider's own endpoint; ``""`` otherwise."""
     from hermes_cli.route_identity import provider_owns_route
     from utils import base_url_hostname
-    host = base_url_hostname(c.base_url)
+    try:
+        host = base_url_hostname(c.base_url)
+    except ValueError:
+        return ""  # malformed route cannot grant the Kimi exception or break auth handling
     if not host or provider_owns_route(c.provider_slug, c.base_url) is True:
         return ""
     return host

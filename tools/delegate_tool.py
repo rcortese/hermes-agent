@@ -494,6 +494,7 @@ def delegate_task(
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     max_children = _get_max_concurrent_children()
+    task_images = []
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
@@ -503,7 +504,8 @@ def delegate_task(
         return tool_error(err)
     from tools.delegation_categories import validate_category_routes
     try:
-        category_routes = validate_category_routes(routing_cfg, task_list, max_iterations=max_iterations)
+        category_routes = validate_category_routes(
+            routing_cfg, task_list, max_iterations=max_iterations, task_images=task_images)
         if category_routes is None:
             creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
             per_task_creds = creds
@@ -666,6 +668,8 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "purpose": _p("string", "Config-owned route purpose, independent of difficulty. Development requires a complete owner development sub-row; images are general-only.",
+                                      enum=["general", "development"], default="general"),
                         "category": _p("string", "Config-owned task difficulty; defaults to analitica. Requires delegation.categories.",
                                        enum=["simples", "analitica", "complexa"]),
                         "goal": _p(

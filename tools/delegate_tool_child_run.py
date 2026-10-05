@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from tools import file_state
+from tools.delegation_categories import category_execution_receipt
 from tools.delegate_tool_progress import _quiet, _safe_progress
 from tools.delegate_tool_registry import (
     _capture_gateway_steer_authority, _close_subagent_steering, _register_subagent, _unregister_subagent,
@@ -36,6 +37,7 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        **category_execution_receipt(child),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -611,8 +613,8 @@ def _build_result_entry(
         "_child_role": getattr(child, "_delegate_role", None),
         "_child_cost_usd": float(_cost or 0.0) if isinstance(_cost, (int, float)) else 0.0,
     }
-    receipt = getattr(child, "_delegation_category_receipt", None)
-    if isinstance(receipt, dict):
+    receipt = category_execution_receipt(child)
+    if receipt:
         entry.update(receipt)
         entry["api_calls"] = getattr(child, "_delegation_category_api_calls", entry["api_calls"])
         if getattr(child, "_delegation_category_accounting_unknown", False):
@@ -782,6 +784,7 @@ class _ChildRun:
     ) -> Dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
         the steer text that won the race with the failure, report the worktree."""
+        entry.update(category_execution_receipt(self.child))
         _safe_progress(
             self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
             duration_seconds=entry["duration_seconds"], summary=summary,

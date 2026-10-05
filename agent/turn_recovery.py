@@ -784,10 +784,26 @@ def limit_reset_epoch(agent: Any, api_error: Exception) -> Optional[float]:
         return None
 
 
-def _stamp_limit_reset(result: Dict[str, Any], agent: Any, api_error: Exception) -> None:
+def _stamp_limit_reset(result: Dict[str, Any], agent: Any, api_error: Exception, classified: Any = None) -> None:
     """``failure_resets_at`` for structured clients (Desktop card: "Limit resets at HH:mm") and the
     same sentence appended to the chat text every plain surface (CLI/TUI/gateway) renders (#98852)."""
-    resets_at = limit_reset_epoch(agent, api_error)
+    ctx = getattr(classified, "error_context", {}) or {}
+    kind = ctx.get("limit_kind")
+    if kind in {"quota", "concurrency"}:
+        result["failure_limit_kind"] = kind
+        if kind == "concurrency":
+            return
+        result["quota_exhausted"] = True
+        if ctx.get("quota_period"):
+            result["quota_period"] = ctx["quota_period"]
+        if ctx.get("reset_unknown"):
+            result.update(reset_unknown=True, retry_probe_after=ctx["retry_probe_after"])
+            return
+        resets_at = ctx.get("reset_at")
+    else:
+        resets_at = ctx.get("reset_at") or limit_reset_epoch(agent, api_error)
+    from agent.credential_pool import _parse_absolute_timestamp
+    resets_at = _parse_absolute_timestamp(resets_at)
     if resets_at is None:
         return
     result["failure_resets_at"] = resets_at
@@ -947,6 +963,23 @@ def nonretryable_client_error_result(
     # Result/guidance helpers stay in the loop module (tests import + patch them there).
     from agent.conversation_loop import _billing_failure_result, _content_policy_blocked_result
 
+    if classified.error_context.get("limit_kind") == "quota" and classified.error_context.get("quota_exhausted"):
+        # No paid-overage or credential advice: this is a periodic membership cap.
+        summary = agent._summarize_api_error(api_error)
+        period = classified.error_context.get("quota_period", "periodic")
+        text = f"Kimi Coding {period} quota exhausted; no available credential or fallback remains."
+        if classified.error_context.get("reset_unknown"):
+            text += (" The provider did not supply a reset time. Hermes will allow a quota probe after"
+                     " 1 hour (conservative retry policy, not a provider reset).")
+        else:
+            text += " Retry after the supplied reset time, or select another provider."
+        agent._flush_status_buffer()
+        agent._persist_session(messages, conversation_history)
+        result = _failed_turn_result(text, messages, api_call_count, summary)
+        result.update(failure_reason=classified.reason.value, failure_retryable=False)
+        _stamp_limit_reset(result, agent, api_error, classified)
+        return result
+
     if api_kwargs is not None:
         agent._dump_api_request_debug(api_kwargs, reason="non_retryable_client_error", error=api_error)
     # Terminal — flush buffered context so the user sees what was tried before the abort.
@@ -1051,7 +1084,7 @@ def nonretryable_client_error_result(
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
     })
-    _stamp_limit_reset(result, agent, api_error)
+    _stamp_limit_reset(result, agent, api_error, classified)
     if _welcome_hint and (_kind := _welcome_surface_kind(classified)):
         # The card form: the desktop renders the sign-in as a button, so no "To sign in" tail.
         _stamp_free_tier(result, _kind,
@@ -1158,7 +1191,8 @@ def max_retries_exhausted_result(
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
-        _reset_at = classified.error_context.get("reset_at")
+        from agent.credential_pool import _parse_absolute_timestamp
+        _reset_at = _parse_absolute_timestamp(classified.error_context.get("reset_at"))
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=max_retries,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
@@ -1190,7 +1224,7 @@ def max_retries_exhausted_result(
         # Present only for billing walls: (provider, billing_url, is_nous, message).
         "billing_block": _billing_block,
     })
-    _stamp_limit_reset(result, agent, api_error)
+    _stamp_limit_reset(result, agent, api_error, classified)
     if _free_tier_kind:
         _stamp_free_tier(result, _free_tier_kind, (
             _welcome_tier_guidance(classified, model=model, in_chat=True, door=False)
@@ -1331,7 +1365,7 @@ def reset_hint(api_error: Exception) -> str:
 
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
-    is_zai_coding_overload: bool, base_url: Any, model: Any,
+    is_zai_coding_overload: bool, base_url: Any, model: Any, error_context: Any = None,
 ) -> float:
     """Pick the wait before the next API retry and announce it. Retry-After wins for
     rate limits and any other retryable error (capped at 600s: Anthropic Tier 1 buckets
@@ -1341,6 +1375,14 @@ def compute_error_backoff(
     # Imported lazily so tests that patch ``agent.retry_utils.jittered_backoff`` /
     # ``adaptive_rate_limit_backoff`` (incl. the run_agent conftest fast-backoff fixture) intercept.
     from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff, parse_retry_after_seconds
+
+    if (error_context or {}).get("limit_kind") == "concurrency":
+        # The retry ceiling is bounded in route_classified_error. Busy requests
+        # finish shortly; never sleep a monthly reset or refresh credentials.
+        wait_time = min(jittered_backoff(retry_count, base_delay=1.0, max_delay=4.0), 8.0)
+        agent._buffer_diagnostic_status(f"⏱️ Concurrent request limit — retrying in {wait_time:.1f}s...")
+        agent._emit_diagnostic_wait(f"⏳ Waiting for ongoing requests — retrying in {wait_time:.0f}s")
+        return wait_time
 
     # Respect Retry-After on every retryable provider error, not just 429s. Retryable
     # 5xx responses (e.g. Cloudflare 520/524) also carry the header or a structured
@@ -1740,6 +1782,25 @@ def route_classified_error(
         retry_count = 0
         compression_attempts = 0
         return _verdict("break")
+
+    if classified.error_context.get("limit_kind") == "quota" and classified.error_context.get("quota_exhausted"):
+        # Pool rotation has already been attempted. Periodic quota cannot clear
+        # in the retry loop: fallback once, otherwise return without backoff or
+        # the generic outage auto-recovery ladder.
+        if agent._try_activate_fallback(reason=classified.reason, reset_at=error_context.get("reset_at")):
+            return _fallback_break()
+        return _verdict("return", nonretryable_client_error_result(
+            agent, api_error, classified, status_code=status_code, api_kwargs=None,
+            api_messages=api_messages, messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count, approx_tokens=0, provider=agent.provider,
+            base_url=base_url, model=model,
+        ))
+
+    if classified.error_context.get("limit_kind") == "concurrency":
+        # Skip eager quota failover; ordinary exhaustion walks the native chain
+        # after at most two short waits / three attempts, without pool mutation.
+        max_retries = min(max_retries, 3)
+        return _verdict("fallthrough")
 
     # ``compression.enabled: false`` forbids every automatic trigger, incl. these
     # overflow recovery paths; error out. Output-cap errors exempt.

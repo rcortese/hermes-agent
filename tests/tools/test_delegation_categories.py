@@ -17,6 +17,7 @@ def config():
 def test_defaults_exact_table_and_upstream_task_fields():
     routes = validate_category_routes(config(), [{"goal": "work", "images": [], "output_schema": {}, "group": "g"}])
     assert routes[0].category == "analitica"
+    assert routes[0].purpose == "general"
     assert routes[0].max_iterations == 80
     assert routes[0].credentials_cfg()["fallback_providers"] == []
 

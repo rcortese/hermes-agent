@@ -390,6 +390,11 @@ def _exhausted_ttl(
     """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
+    if failure_reason == "quota_exhausted":
+        # Unknown periodic reset: probe after an hour even with a sole key.
+        # This TTL is policy, not a provider reset; explicit reset_at wins in
+        # _exhausted_until before the TTL is consulted.
+        return EXHAUSTED_TTL_429_SECONDS
     base = EXHAUSTED_TTL_429_SECONDS if error_code == 429 else EXHAUSTED_TTL_DEFAULT_SECONDS
     if failure_reason == FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)

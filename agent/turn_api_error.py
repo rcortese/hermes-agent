@@ -113,6 +113,15 @@ def handle_api_error(
         base_url=str(getattr(agent, "base_url", "") or ""),
         api_key=getattr(agent, "api_key", None),
     )
+    # Classification supplies semantics the raw SDK extractor cannot know (e.g.
+    # Coding quota vs concurrency on 403). Both recovery and terminal surfaces
+    # must see the same context; the classifier's trusted reset takes precedence.
+    error_context = {**(error_context or {}), **classified.error_context}
+    if classified.error_context.get("reset_unknown") or classified.error_context.get("limit_kind") == "concurrency":
+        # Do not resurrect a malformed/stale raw reset or a quota-sized wait for
+        # concurrency after the semantic classifier rejected it.
+        error_context.pop("reset_at", None)
+    classified.error_context = error_context
     logger.debug(
         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
         classified.reason.value, classified.status_code,
@@ -392,6 +401,7 @@ def settle_unrecovered_error(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
         base_url=_base, model=_model,
+        error_context=error_context,
     )
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".

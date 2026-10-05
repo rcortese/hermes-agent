@@ -803,6 +803,9 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
 
 
 def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
+    # Periodic caps will not clear on an immediate retry, regardless of wording.
+    if (error_context or {}).get("quota_exhausted") or (error_context or {}).get("usage_limit_reached"):
+        return (True, False) if rotate_and_swap(429, "periodic quota") else (False, True)
     # Already-exhausted credential: rotate immediately. Avoids the "cancel-between-429s" trap where
     # the local has_retried_429 resets per prompt and retries forever.
     current_entry = None
@@ -884,6 +887,9 @@ def recover_with_credential_pool(
         # need opposite cooldowns.
         if effective_reason is not None:
             failure_reason = effective_reason.value
+            if effective_reason == FailoverReason.rate_limit and (error_context or {}).get("quota_exhausted"):
+                # Persist a pool-local TTL discriminator, not a new global reason.
+                failure_reason = "quota_exhausted"
             if effective_reason == FailoverReason.billing and billing_unverified:
                 # Ambiguous billing body: size the cooldown as transient, not a 1-hour bench.
                 from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
@@ -945,6 +951,10 @@ def recover_with_credential_pool(
         # match the key that failed, not a different account.
         return (True, False) if _rotate_and_swap(402, "billing") else (False, has_retried_429)
     if effective_reason == FailoverReason.rate_limit:
+        if (error_context or {}).get("limit_kind") == "concurrency":
+            # A busy account is not an exhausted credential. Retry briefly on the
+            # same key, then use the existing bounded fallback path.
+            return False, has_retried_429
         return _recover_rate_limit(
             pool, has_retried_429=has_retried_429, error_context=error_context,
             api_key_hint=api_key_hint, credential_id=credential_id, rotate_and_swap=_rotate_and_swap,
