@@ -37,6 +37,7 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
+from tools.approval_manual_floor import _smart_manual_floor_reason
 
 logger = logging.getLogger(__name__)
 
@@ -1171,20 +1172,23 @@ def check_all_command_guards(command: str, env_type: str,
         return blocked
 
     from agent.terminal_approval_batch import consume_prepared_guard
+    manual_floor_reason = _smart_manual_floor_reason(command)
     prepared = consume_prepared_guard(command, env_type, has_host_access)
-    if prepared is not None:
+    if prepared is not None and manual_floor_reason is None:
         return prepared
 
     approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
+    if manual_floor_reason is None and (_yolo_active() or approval_mode == "off"):
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if manual_floor_reason is None and _command_matches_permanent_allowlist(command):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
+        if manual_floor_reason is not None:
+            return {"approved": False, "message": f"Human approval required: {manual_floor_reason}; no human approval transport is present."}
         for ctx in _unattended_contexts():
             result = _unattended_deny(command, ctx)
             if result is not None:
@@ -1205,6 +1209,8 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
     if is_dangerous and not is_approved(session_key, pattern_key):
         warnings.append((pattern_key, description, False))
+    if manual_floor_reason is not None:
+        warnings.append((manual_floor_reason, manual_floor_reason, False))
     if not warnings:
         return _approved()
 
@@ -1219,8 +1225,9 @@ def check_all_command_guards(command: str, env_type: str,
         _COMMAND_GATE, command=command, description=combined_desc,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
         session_key=session_key, approval_callback=approval_callback,
-        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
-        permanent_capable=any(not is_t for _, _, is_t in warnings),
+        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        smart=approval_mode == "smart" and manual_floor_reason is None,
+        permanent_capable=manual_floor_reason is None and any(not is_t for _, _, is_t in warnings),
     )
 
 

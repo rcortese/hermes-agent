@@ -223,12 +223,28 @@ def safe_http_client(base_url, timeout, *, api_key='local'):
     from urllib.parse import urlsplit
     expected = urlsplit(base_url)
     credential_name = re.compile(r'^(?:x[-_])?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|token|password|passwd|secret|client[-_]?secret|credential|auth|key)$', re.I)
+    # Honcho's session-context endpoint takes a plain 'tokens' budget as a GET
+    # query parameter; it is not a credential and is exempted below, but only
+    # for this exact endpoint/method/shape, and only as a small canonical
+    # positive integer (a defensive cap we choose, not a server-imposed limit).
+    context_path = re.compile(r'/v3/workspaces/[A-Za-z0-9_-]{1,256}/sessions/[A-Za-z0-9_-]{1,256}/context')
+    canonical_tokens_value = re.compile(r'[1-9][0-9]{0,4}|100000')
     def outbound(request):
         if (request.url.scheme, request.url.host, request.url.port) != (expected.scheme, expected.hostname, expected.port or (443 if expected.scheme == 'https' else 80)):
             raise ValueError('Honcho destination drift')
         if request.url.userinfo or scrub(request.url.path) != request.url.path:
             raise ValueError('Credential-bearing Honcho URL refused')
-        for name, value in request.url.params.multi_items():
+        query_items = request.url.params.multi_items()
+        tokens_exempt = (
+            request.method == 'GET'
+            and context_path.fullmatch(request.url.path) is not None
+            and sum(1 for name, _ in query_items if name == 'tokens') == 1
+        )
+        for name, value in query_items:
+            if name == 'tokens':
+                if tokens_exempt and canonical_tokens_value.fullmatch(value):
+                    continue
+                raise ValueError('Credential-bearing Honcho query refused')
             if credential_name.fullmatch(name) or scrub(name + '=' + value) != name + '=' + value:
                 raise ValueError('Credential-bearing Honcho query refused')
         for name, value in request.headers.multi_items():

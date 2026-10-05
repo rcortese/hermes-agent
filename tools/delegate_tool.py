@@ -746,6 +746,10 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     """Drop trusted-config-only task fields from model-supplied tasks (same list object back when nothing changed)."""
     if not isinstance(tasks, list) or not any(isinstance(t, dict) and _MODEL_HIDDEN_TASK_FIELDS & t.keys() for t in tasks):
         return tasks
+    if "categories" in _load_config():
+        # Preserve disallowed fields for category validation to reject them.
+        # Silently stripping an override would hide an invalid model request.
+        return tasks
     return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
 
 
