@@ -1195,7 +1195,61 @@ class GatewayNotificationsMixin:
                 return a
         return None
 
+    async def _wake_api_delegation(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """Standalone opt-in continuation; busy is a refundable refusal, not a delivered result.
+
+        Uses the existing scoped in-process turn and transcript lease, not a retrying HTTP POST.
+        The durable completion claim and this process's identity dedupe remain authoritative.
+        Crash replay remains at least once; Stop cannot control the untracked internal turn.
+        """
+        from gateway.wake import WakeNotAccepted, persist_delegation_delivery
+        owner = str(getattr(self, "_primary_profile_name", "") or "").strip()
+        turn = getattr(adapter, "run_internal_session_turn", None)
+        if not owner or not callable(turn):
+            raise WakeNotAccepted("delegation continuation requires an owner and internal turn helper")
+        delegation_id = str(evt["delegation_id"])
+        started = getattr(self, "_api_delegation_wakes_started", None)
+        if started is None:
+            started = self._api_delegation_wakes_started = set()
+        if delegation_id in started:
+            return True
+        if (getattr(adapter, "_inflight_agent_runs", 0)
+                or getattr(adapter, "_active_run_tasks", {})
+                or getattr(adapter, "_active_run_agents", {})
+                or getattr(adapter, "_stopping_run_ids", set())
+                or getattr(adapter, "_run_approval_registry", {})
+                or adapter._draining_response() is not None):
+            raise WakeNotAccepted("delegation continuation deferred until API gateway is idle")
+        await persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
+        # Record before entering the executor: an ambiguous post-entry failure must not rerun
+        # commands automatically. The result remains durable for a later human turn.
+        started.add(delegation_id)
+        text = (
+            "[INTERNAL DELEGATION CONTINUATION — not a new human message or approval. "
+            "Integrate these worker results and continue only the already authorized task. "
+            "If waiting for human permission, keep waiting. Reconcile partial/interrupted "
+            "work; do not blindly repeat effects. Deliver the user-facing result.]\n\n"
+            + synth_text
+        )
+        try:
+            await turn(session_id=raw_sid, text=text, profile=owner, notification_category="result")
+        except Exception:
+            logger.exception("Delegation continuation failed after entry; result retained, no automatic rerun: %s",
+                             delegation_id)
+        else:
+            logger.info("Delegation parent continuation finished for %s", delegation_id)
+        return True
+
     async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """Persist API delegation results; optionally continue standalone operator-owned tasks."""
+        import os
+        if (evt.get("type") == "async_delegation" and evt.get("delegation_id")
+                and not evt.get("task_failure_notice")
+                and os.getenv("HERMES_API_DELEGATION_WAKE", "") == "1"
+                and not getattr(self.config, "multiplex_profiles", False)):
+            # Keep refusal outside the broad transport exception handler below so the
+            # durable delivery wrapper refunds it and busy -> idle remains retryable.
+            return await self._wake_api_delegation(adapter, synth_text, raw_sid, evt)
         """Deliver to a non-push (api_server) session by raw session id.
 
         Async-delegation completions are persisted as a durable delivery row — after the parent
